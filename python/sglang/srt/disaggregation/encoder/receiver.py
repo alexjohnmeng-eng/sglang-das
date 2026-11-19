@@ -860,7 +860,20 @@ def _validate_embedding_part(
             f"num_parts changed from {current.num_parts} to {embedding_data.num_parts}"
         )
     if current.ready_list[embedding_data.part_idx]:
-        raise ValueError(f"duplicate embedding part {embedding_data.part_idx}")
+        raise DuplicateEmbeddingPartError(
+            f"duplicate embedding part {embedding_data.part_idx}"
+        )
+
+
+class DuplicateEmbeddingPartError(ValueError):
+    """The same part arrived twice for one request.
+
+    A retried ``/send`` whose first response was lost delivers a second
+    completion ack for a part the receiver already assembled. That is a
+    transport duplicate, not a malformed request: ignoring it keeps the
+    request alive, while failing it would turn a lost HTTP response into a
+    user-visible error.
+    """
 
 
 def _aggregate_embedding_part(current, recv_obj, model_type):
@@ -869,7 +882,14 @@ def _aggregate_embedding_part(current, recv_obj, model_type):
         return MultiModalEmbeddingData.from_embedding_data(
             recv_obj, model_type=model_type
         )
-    current.add(recv_obj)
+    try:
+        current.add(recv_obj)
+    except DuplicateEmbeddingPartError:
+        logger.warning(
+            "Ignoring duplicate embedding part %s for req_id=%s (retried /send)",
+            recv_obj.part_idx,
+            current.req_id,
+        )
     return current
 
 
@@ -1773,6 +1793,9 @@ class SharedWaitingRDMARequest(WaitingRDMARequest):
         # owner's DATA_READY, not just for the metadata acks.
         self._expects_buffer = False
         self._failed_acked = False
+        # Set when this rank's /send died without proving the encoder stopped
+        # writing; the ack then retires the slot range instead of recycling it.
+        self._drain_unknown = False
 
     def _ack_once(self) -> None:
         """Tell the owner this rank is done with the request (idempotent)."""
@@ -1780,7 +1803,7 @@ class SharedWaitingRDMARequest(WaitingRDMARequest):
             return
         self._failed_acked = True
         try:
-            self.arena.release(self.rid)
+            self.arena.release(self.rid, drain_unknown=self._drain_unknown)
         except Exception:
             logger.exception(
                 "Shared arena: failed to acknowledge rid=%s", self.rid
@@ -1894,6 +1917,15 @@ class SharedWaitingRDMARequest(WaitingRDMARequest):
             offset += embedding_sizes[idx]
 
         send_responses = await asyncio.gather(*send_tasks, return_exceptions=True)
+        if self._is_owner and any(
+            isinstance(resp, (asyncio.TimeoutError, aiohttp.ClientError))
+            for resp in send_responses
+        ):
+            # The encoder keeps a zero-copy transfer alive after its HTTP
+            # caller goes away, so a write may still be in flight into this
+            # slot. An explicit HTTP error answer proves it never started; a
+            # timeout or a dropped connection proves nothing.
+            self._drain_unknown = True
         if not await self._check_encoder_responses(send_responses, "/send"):
             self.arena.mark_failed(self.rid, "encoder /send failed")
             return

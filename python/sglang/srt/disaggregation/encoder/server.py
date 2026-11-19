@@ -367,6 +367,14 @@ class ReqState:
     lifecycle_condition: asyncio.Condition = field(
         default_factory=asyncio.Condition, repr=False
     )
+    # Destinations this request already delivered to. A decoder retries /send
+    # when the HTTP response is lost; running the transfer again would emit a
+    # second completion ack for the same part, which the receiver rejects as a
+    # duplicate and fails the whole request.
+    sent_destinations: Set[str] = field(default_factory=set, repr=False)
+    # One lock per destination, so a retry that races the still-running first
+    # attempt waits for it instead of transferring twice.
+    send_locks: Dict[str, asyncio.Lock] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True)
@@ -400,6 +408,17 @@ class SendDestination:
     @classmethod
     def from_url(cls, url: str) -> "SendDestination":
         return cls(endpoint=NetworkAddress.parse(url).to_host_port_str())
+
+    def idempotency_key(self) -> str:
+        """Identify one transfer target within one request.
+
+        Multi-part requests send each part to a distinct ``buffer_address``, so
+        the address is what tells two parts addressed to the same rank apart.
+        """
+        return (
+            f"{self.endpoint}|session={self.session_id}"
+            f"|addr={self.buffer_address}|meta_only={int(self.meta_only)}"
+        )
 
 
 class TensorWrapper:
@@ -837,6 +856,15 @@ class MMEncoder:
     async def send_to_destination(
         self, state: ReqState, destination: SendDestination
     ) -> None:
+        """Deliver one part to one destination, at most once per request.
+
+        ``/send`` is retried by the receiver when the HTTP response is lost.
+        The transfer itself is not idempotent as seen by the peer: every call
+        emits a completion ack, and a second ack for an already-received part
+        makes the receiver reject the whole request as a duplicate. Serialize
+        per destination and skip a target this request already served.
+        """
+        key = destination.idempotency_key()
         async with state.lifecycle_condition:
             if (
                 self.req_states.get(state.req_id) is not state
@@ -844,8 +872,22 @@ class MMEncoder:
             ):
                 raise InternalError(f"Encoder request was released: {state.req_id}")
             state.active_sends += 1
+            lock = state.send_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                state.send_locks[key] = lock
         try:
-            await self.delivery.send(state, destination)
+            async with lock:
+                if key in state.sent_destinations:
+                    logger.info(
+                        "Duplicate /send for req_id=%s -> %s already delivered; "
+                        "returning success without re-sending",
+                        state.req_id,
+                        key,
+                    )
+                    return
+                await self.delivery.send(state, destination)
+                state.sent_destinations.add(key)
         finally:
             async with state.lifecycle_condition:
                 state.active_sends -= 1

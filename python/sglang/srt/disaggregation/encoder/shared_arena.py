@@ -146,7 +146,14 @@ class SharedEmbeddingArena:
         self._force_frees = 0
         self._abandoned_bytes = 0
         self._last_stats = time.monotonic()
-        self._last_tick = 0.0
+        # Monotonic count of tick() calls; identical on every rank because the
+        # scheduler loop calls it once per iteration everywhere.
+        self._tick_calls = 0
+        # rids whose /send died without proof that the encoder stopped writing
+        # (owner frees those slots permanently instead of recycling them)
+        self._drain_unknown: Set[str] = set()
+        # this rank's report of such rids, shipped on the next tick
+        self._unsafe_acks: List[str] = []
 
         logger.info(
             "SharedEmbeddingArena ready: rank=%d/%d owner=%s size=%dMB base=0x%x "
@@ -247,9 +254,18 @@ class SharedEmbeddingArena:
     # release (duck-typed EmbeddingPool API, so leases work unchanged)
     # ------------------------------------------------------------------ #
     def release(
-        self, rid: str, ready_event: Optional[torch.cuda.Event] = None
+        self,
+        rid: str,
+        ready_event: Optional[torch.cuda.Event] = None,
+        drain_unknown: bool = False,
     ) -> None:
-        """Acknowledge a slot once this rank no longer reads it."""
+        """Acknowledge a slot once this rank no longer reads it.
+
+        ``drain_unknown`` says the encoder's write could not be proven
+        finished (the /send died with a timeout or a dropped connection). The
+        ack only covers the local reader, so the owner must retire the range
+        permanently instead of putting it back in the free list.
+        """
         if ready_event is None and torch.cuda.is_available():
             # GC / abort path: fence conservatively on the current stream so a
             # copy queued before the release cannot be overwritten.
@@ -263,6 +279,8 @@ class SharedEmbeddingArena:
                 )
                 ready_event = None
         with self._lock:
+            if drain_unknown:
+                self._unsafe_acks.append(rid)
             if ready_event is not None and not ready_event.query():
                 self._ack_waiters.append((rid, ready_event))
             else:
@@ -277,19 +295,22 @@ class SharedEmbeddingArena:
     def tick(self) -> None:
         """Exchange allocations / acknowledgements with the other ranks.
 
-        Called from every rank once per scheduler iteration, throttled to a
-        small wall-time interval so an idle scheduler does not pay a
-        collective per loop. Ranks may land on different ticks; gloo pairs the
-        k-th call on each rank, so a bounded period on every rank is enough.
+        Called from every rank exactly once per scheduler iteration. The
+        collective uses the TP CPU process group, which the scheduler also
+        uses for its own broadcasts, so the decision to enter must be
+        identical on every rank: a rank-local wall-clock gate would let one
+        rank issue all_gather while another issues broadcast and desynchronise
+        the group. The call counter below is such a gate because every rank
+        runs the same number of scheduler iterations.
+
         The owner's assignments are published in the payload, so a peer learns
-        them one tick later -- milliseconds, against the hundreds of
-        milliseconds an embedding transfer takes.
+        them one tick later -- one scheduler iteration, against the hundreds
+        of milliseconds an embedding transfer takes.
         """
-        now = time.monotonic()
-        interval = envs.SGLANG_EMBEDDING_POOL_TICK_INTERVAL_S.get()
-        if now - self._last_tick < interval:
+        self._tick_calls += 1
+        every = envs.SGLANG_EMBEDDING_POOL_TICK_EVERY.get()
+        if every > 1 and self._tick_calls % every:
             return
-        self._last_tick = now
         self._drain_acks()
         with self._lock:
             pending = [
@@ -299,6 +320,8 @@ class SharedEmbeddingArena:
             ]
             ack_payload = self._acks_ready
             self._acks_ready = []
+            unsafe_payload = self._unsafe_acks
+            self._unsafe_acks = []
             assign_payload = self._publish
             self._publish = {}
             state_payload = {
@@ -313,6 +336,7 @@ class SharedEmbeddingArena:
             "rank": self.rank,
             "req": pending,
             "ack": ack_payload,
+            "unsafe": unsafe_payload,
             "assign": assign_payload,
             "state": state_payload if self.is_owner else None,
             "inflight": inflight,
@@ -333,6 +357,10 @@ class SharedEmbeddingArena:
                 # Ack tally is owner-side state; peers would only grow it.
                 for rid in item["ack"]:
                     self._acks_seen.setdefault(rid, set()).add(item["rank"])
+                # A rank whose /send died without drain proof asks the owner to
+                # retire the range instead of recycling it.
+                for rid in item.get("unsafe", ()):
+                    self._drain_unknown.add(rid)
             for rid, assignment in (item["assign"] or {}).items():
                 self._adopt(rid, assignment)
             if item["state"] is not None:
@@ -371,6 +399,14 @@ class SharedEmbeddingArena:
                 excess = len(self._failed) - _STATE_KEEP
                 for rid in list(self._failed)[:excess]:
                     self._failed.pop(rid, None)
+            # Marks whose slot is already gone (TTL, abort) would otherwise
+            # accumulate for the life of the process.
+            if len(self._drain_unknown) > _STATE_KEEP:
+                for rid in list(self._drain_unknown):
+                    if rid not in self._slots:
+                        self._drain_unknown.discard(rid)
+                    if len(self._drain_unknown) <= _STATE_KEEP:
+                        break
 
     def _adopt(self, rid: str, assignment: Tuple[int, int]) -> None:
         with self._lock:
@@ -465,13 +501,34 @@ class SharedEmbeddingArena:
     def _owner_reap(self) -> None:
         """Free slots every rank acknowledged, and force-free stale ones."""
         ttl = envs.SGLANG_EMBEDDING_POOL_SLOT_TTL_S.get()
+        abandon_unsafe = envs.SGLANG_EMBEDDING_POOL_ABANDON_ON_SEND_FAILURE.get()
         now = time.monotonic()
         with self._lock:
             for rid, slot in list(self._slots.items()):
                 acked = self._acks_seen.get(rid, set())
                 if len(acked) >= self.world_size:
-                    self._free_slot_locked(slot)
+                    if abandon_unsafe and rid in self._drain_unknown:
+                        # Every rank acked, but a /send died without proof the
+                        # encoder stopped writing: the ack only covers local
+                        # reads. A late RDMA write would overwrite whichever
+                        # request reuses this range, so retire it for good.
+                        self._force_frees += 1
+                        self._abandoned_bytes += _align_up(slot.nbytes, _ALIGN)
+                        logger.error(
+                            "SharedEmbeddingArena: abandoning rid=%s (%dMB): "
+                            "a /send failed without drain proof; %dMB lost "
+                            "until restart",
+                            rid,
+                            slot.nbytes // (1024 * 1024),
+                            self._abandoned_bytes // (1024 * 1024),
+                        )
+                        self._free_slot_locked(slot, reusable=False)
+                        self._dead.add(rid)
+                        self._dead_order.append(rid)
+                    else:
+                        self._free_slot_locked(slot)
                     self._acks_seen.pop(rid, None)
+                    self._drain_unknown.discard(rid)
                 elif ttl > 0 and now - slot.allocated_at > ttl:
                     # A rank that never acked is a bug, not a crash (a crash
                     # takes the whole TP group down). The missing rank may
@@ -491,6 +548,7 @@ class SharedEmbeddingArena:
                     )
                     self._free_slot_locked(slot, reusable=False)
                     self._acks_seen.pop(rid, None)
+                    self._drain_unknown.discard(rid)
                     self._dead.add(rid)
                     self._dead_order.append(rid)
 

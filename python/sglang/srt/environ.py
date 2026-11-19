@@ -1777,10 +1777,19 @@ class Envs:
     # RDMA write that is still draining (or a laggard reader) cannot land in
     # a slot that already belongs to the next request.
     SGLANG_EMBEDDING_POOL_REUSE_DELAY_S = EnvFloat(2.0)
-    # Minimum wall time between shared-arena collectives, bounding the cost on
-    # an idle scheduler. Ranks may tick at slightly different times; gloo pairs
-    # the k-th call on each rank, so a bounded period on every rank is enough.
-    SGLANG_EMBEDDING_POOL_TICK_INTERVAL_S = EnvFloat(0.002)
+    # Enter the shared-arena collective every N scheduler iterations. The gate
+    # must be identical on every rank: the arena's all_gather_object shares its
+    # process group with the scheduler's own collectives, so a rank-local time
+    # gate would let one rank issue all_gather while another issues broadcast
+    # and desynchronise the group. tick() runs once per scheduler iteration on
+    # every rank, so a call counter keeps them in lockstep. 1 = every iteration.
+    SGLANG_EMBEDDING_POOL_TICK_EVERY = EnvInt(1)
+    # A /send failure that cannot prove the encoder stopped writing (timeout or
+    # dropped connection) permanently abandons that slot range instead of
+    # recycling it after the reuse delay: a late RDMA write would otherwise
+    # overwrite whichever request gets the range next. Costs arena bytes until
+    # restart; set 0 only for debugging.
+    SGLANG_EMBEDDING_POOL_ABANDON_ON_SEND_FAILURE = EnvBool(True)
     # Debug: assert that the CP keep masks partition the multimodal rows.
     SGLANG_EMBEDDING_POOL_DEBUG_KEEP = EnvInt(0)
     SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT = EnvInt(64)
