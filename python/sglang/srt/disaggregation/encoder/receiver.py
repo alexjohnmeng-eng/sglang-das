@@ -2920,14 +2920,20 @@ class MMReceiverBase(ABC):
             encode_thread.start()
             return scheduler_dispatch_ready
         else:
-            # No encoder URLs available (bootstrap may not have any registered yet);
-            # reset the flag so the scheduler does not wait for embeddings that will
-            # never arrive.  A warning is emitted so the user can diagnose why
-            # disaggregation is not happening for this request.
+            # No encoder URLs available: the bootstrap server has none
+            # registered (typical right after an encoder restart). Falling back
+            # to "process without disaggregation" is only safe when the request
+            # carries no raw media; otherwise the language-only scheduler has
+            # no vision tower, raises inside the model forward, and takes the
+            # whole scheduler process down. Fail this request instead - both
+            # call sites (tokenizer ingress and the scheduler retry path) turn
+            # the exception into a per-request error, and the client can retry
+            # once an encoder is registered.
             if mm_data:
-                logger.warning(
-                    f"No encoder URLs available for request {obj.rid}; "
-                    "processing without encoder disaggregation."
+                raise RuntimeError(
+                    f"No encoder URLs registered while dispatching request "
+                    f"{obj.rid}; refusing to serve multimodal input without "
+                    "encoder disaggregation"
                 )
             obj.need_wait_for_mm_inputs = False
             return None
