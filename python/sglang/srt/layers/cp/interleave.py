@@ -265,6 +265,10 @@ class InterleaveCPStrategy(ContextParallelStrategy):
 
         return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
 
+    def row_keep_mask(self, rows):
+        """Interleave keeps every cp_size-th flat row, starting at this rank."""
+        return (rows % self.cp_size) == self.cp_rank
+
     def local_q_indices(self, num_tokens: int, forward_batch) -> Any:
         device = getattr(getattr(forward_batch, "input_ids", None), "device", None)
         if device is None:

@@ -1,0 +1,608 @@
+"""One pinned host embedding arena shared by every TP/CP rank of a prefill node.
+
+The EPD encoder pushes ViT embeddings over RDMA. Without sharing, every rank
+receives its own copy (the encoder writes ``tp_size`` times) and keeps it in
+device memory. This module keeps a single pinned host allocation instead:
+
+* the arena lives in one ``hipHostMalloc`` region created by rank 0 and mapped
+  into every rank through HSA IPC (``HostSharedMemoryManager(use_hsa_ipc=True)``,
+  the same primitive the Engram host table uses);
+* only the owner (rank 0) registers the arena with mooncake and receives the
+  RDMA write -- one transfer per request instead of ``tp_size``;
+* every rank reads its own virtual address of those physical pages, so slot
+  contents need no further coordination.
+
+Slot bookkeeping is request-scoped and single-writer: the owner allocates and
+frees, the other ranks adopt the owner's decision. Both directions ride the
+collective the scheduler already performs every iteration (``tick``), so there
+is no cross-process lock, no shared free list and no cross-process CUDA event.
+
+Lifecycle, in one place:
+
+    require(rid)          receive thread asks for a slot
+    tick()                owner allocates -> publishes (offset, nbytes)
+    mark_data_ready(rid)  owner finished the RDMA write
+    ... consumer stages its chunk rows to the GPU ...
+    release(rid, event)   ack once the reader's stream event completes
+    tick()                owner frees after every rank acknowledges
+
+Anything that can be allocated must be released exactly once: the normal path,
+every failure path and the lease GC finalizer all funnel into ``release``, and
+the owner force-reclaims a slot whose acknowledgements stop arriving.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+import weakref
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
+
+import torch
+
+from sglang.srt.environ import envs
+from sglang.srt.utils.host_shared_memory import HostSharedMemoryManager
+from sglang.utils import logger
+
+_ALIGN = 256
+# Request-state dicts keep the recent past for diagnostics; older entries are
+# dropped so a long-running server does not grow without bound.
+_STATE_KEEP = 4096
+
+
+@dataclass
+class _Slot:
+    offset: int
+    nbytes: int
+    rid: str
+    allocated_at: float
+
+
+class _SlotRequest:
+    """One rank's blocking wait for the owner's assignment."""
+
+    __slots__ = ("rid", "nbytes", "deadline", "event", "result", "error")
+
+    def __init__(self, rid: str, nbytes: int, deadline: float):
+        self.rid = rid
+        self.nbytes = nbytes
+        self.deadline = deadline
+        self.event = threading.Event()
+        self.result: Optional[Tuple[int, int]] = None
+        self.error: Optional[str] = None
+
+    def resolve(self, offset: int, nbytes: int) -> None:
+        self.result = (offset, nbytes)
+        self.event.set()
+
+    def fail(self, error: str) -> None:
+        self.error = error
+        self.event.set()
+
+
+class SharedEmbeddingArena:
+    """Pinned host slots shared by all ranks; see the module docstring."""
+
+    def __init__(
+        self,
+        group,
+        rank_in_group: int,
+        size_bytes: int,
+        engine=None,
+        name: str = "sglang_emb_pool",
+    ):
+        self.group = group
+        self.rank = rank_in_group
+        self.world_size = group.world_size
+        self.is_owner = rank_in_group == 0
+        self.size_bytes = size_bytes
+        self.engine = engine
+
+        self._manager = HostSharedMemoryManager(
+            f"{name}_r{self.world_size}", group=group, use_hsa_ipc=True
+        )
+        self.buffer = self._manager.malloc(shape=(size_bytes,), dtype=torch.uint8)
+        self.base = self.buffer.data_ptr()
+        self._host_async = True
+        if self.is_owner and engine is not None:
+            engine.register(self.base, self.buffer.nbytes)
+
+        self._lock = threading.Lock()
+        # receive threads waiting for an assignment
+        self._requests: Dict[str, _SlotRequest] = {}
+        # owner: assignments to publish on the next tick
+        self._publish: Dict[str, Tuple[int, int]] = {}
+        # every rank: assignments adopted from the owner
+        self._assigned: Dict[str, Tuple[int, int]] = {}
+        # owner: live slots
+        self._slots: Dict[str, _Slot] = {}
+        # owner: free segments ready to hand out
+        self._free: List[Tuple[int, int]] = [
+            (_align_up(4096, _ALIGN), size_bytes - _align_up(4096, _ALIGN))
+        ]
+        # owner: (reusable_at, offset, length) freed but still quarantine
+        self._quarantine: List[Tuple[float, int, int]] = []
+        # shared state propagated by the owner
+        self._data_ready: Set[str] = set()
+        self._failed: Dict[str, str] = {}
+        # owner: slots freed since the last tick, so peers can prune their
+        # copies of the request state instead of growing without bound
+        self._freed_pending: List[str] = []
+        # released but not yet acknowledged upward (event-gated)
+        self._ack_waiters: List[Tuple[str, torch.cuda.Event]] = []
+        self._acks_ready: List[str] = []
+        # ack sets the owner has seen so far, rid -> {rank}
+        self._acks_seen: Dict[str, Set[int]] = {}
+        # owner: request deadlines so a stuck alloc cannot hang a receive thread
+        self._pending_since: Dict[str, float] = {}
+        self._dead: Set[str] = set()
+        self._dead_order: List[str] = []
+
+        self._total_inflight = 0
+        self._peak_inflight = 0
+        self._alloc_waits = 0
+        self._alloc_timeouts = 0
+        self._force_frees = 0
+        self._abandoned_bytes = 0
+        self._last_stats = time.monotonic()
+        self._last_tick = 0.0
+
+        logger.info(
+            "SharedEmbeddingArena ready: rank=%d/%d owner=%s size=%dMB base=0x%x "
+            "rdma_registered=%s",
+            self.rank,
+            self.world_size,
+            self.is_owner,
+            size_bytes // (1024 * 1024),
+            self.base,
+            bool(self.is_owner and engine is not None),
+        )
+
+    # ------------------------------------------------------------------ #
+    # allocation
+    # ------------------------------------------------------------------ #
+    def request_slot(
+        self, rid: str, nbytes: int, timeout: Optional[float] = None
+    ) -> Optional[Tuple[int, int]]:
+        """Ask the owner for a slot; returns ``(offset, nbytes)`` or None.
+
+        The owner allocates during the next tick, so this blocks the receive
+        thread for at most one scheduler iteration plus whatever the arena is
+        full for.
+        """
+        if timeout is None:
+            timeout = envs.SGLANG_EMBEDDING_POOL_ALLOC_TIMEOUT_S.get()
+        if nbytes > self.size_bytes:
+            logger.error(
+                "SharedEmbeddingArena: request %dMB exceeds arena %dMB",
+                nbytes // (1024 * 1024),
+                self.size_bytes // (1024 * 1024),
+            )
+            return None
+        req = _SlotRequest(rid, nbytes, time.monotonic() + timeout)
+        with self._lock:
+            if rid in self._dead:
+                return None
+            # The owner may have allocated this request before this rank's
+            # receive thread got here (it allocates from the union of every
+            # rank's pending list). Adopt the published offset now: `tick`
+            # never republishes an assigned rid, so waiting would hang.
+            assigned = self._assigned.get(rid)
+            if assigned is not None:
+                return assigned
+            self._requests[rid] = req
+        if not req.event.wait(timeout):
+            with self._lock:
+                self._requests.pop(rid, None)
+                self._alloc_timeouts += 1
+            logger.error(
+                "SharedEmbeddingArena: slot for rid=%s (%dMB) timed out after %.1fs",
+                rid,
+                nbytes // (1024 * 1024),
+                timeout,
+            )
+            return None
+        with self._lock:
+            self._requests.pop(rid, None)
+        if req.error is not None:
+            logger.error("SharedEmbeddingArena: slot for rid=%s failed: %s", rid, req.error)
+            return None
+        return req.result
+
+    def view(self, offset: int, nbytes: int) -> torch.Tensor:
+        return self.buffer[offset : offset + nbytes]
+
+    # ------------------------------------------------------------------ #
+    # readiness / failure
+    # ------------------------------------------------------------------ #
+    def mark_data_ready(self, rid: str) -> None:
+        with self._lock:
+            self._data_ready.add(rid)
+
+    def mark_failed(self, rid: str, reason: str = "") -> None:
+        with self._lock:
+            self._failed[rid] = reason or "shared arena failure"
+
+    def is_data_ready(self, rid: str) -> bool:
+        with self._lock:
+            return rid in self._data_ready
+
+    def wait_data_ready(self, rid: str, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if rid in self._data_ready:
+                    return True
+                if rid in self._failed:
+                    return False
+            time.sleep(0.002)
+        return False
+
+    def failure_reason(self, rid: str) -> str:
+        with self._lock:
+            return self._failed.get(rid, "shared arena failure")
+
+    # ------------------------------------------------------------------ #
+    # release (duck-typed EmbeddingPool API, so leases work unchanged)
+    # ------------------------------------------------------------------ #
+    def release(
+        self, rid: str, ready_event: Optional[torch.cuda.Event] = None
+    ) -> None:
+        """Acknowledge a slot once this rank no longer reads it."""
+        if ready_event is None and torch.cuda.is_available():
+            # GC / abort path: fence conservatively on the current stream so a
+            # copy queued before the release cannot be overwritten.
+            try:
+                ready_event = torch.cuda.Event()
+                ready_event.record(torch.cuda.current_stream())
+            except Exception:
+                logger.warning(
+                    "SharedEmbeddingArena: could not record a release fence",
+                    exc_info=True,
+                )
+                ready_event = None
+        with self._lock:
+            if ready_event is not None and not ready_event.query():
+                self._ack_waiters.append((rid, ready_event))
+            else:
+                self._acks_ready.append(rid)
+
+    def release_on_gc(self, obj, rid: str):
+        return weakref.finalize(obj, self.release, rid)
+
+    # ------------------------------------------------------------------ #
+    # the per-iteration collective
+    # ------------------------------------------------------------------ #
+    def tick(self) -> None:
+        """Exchange allocations / acknowledgements with the other ranks.
+
+        Called from every rank once per scheduler iteration, throttled to a
+        small wall-time interval so an idle scheduler does not pay a
+        collective per loop. Ranks may land on different ticks; gloo pairs the
+        k-th call on each rank, so a bounded period on every rank is enough.
+        The owner's assignments are published in the payload, so a peer learns
+        them one tick later -- milliseconds, against the hundreds of
+        milliseconds an embedding transfer takes.
+        """
+        now = time.monotonic()
+        interval = envs.SGLANG_EMBEDDING_POOL_TICK_INTERVAL_S.get()
+        if now - self._last_tick < interval:
+            return
+        self._last_tick = now
+        self._drain_acks()
+        with self._lock:
+            pending = [
+                (rid, req.nbytes)
+                for rid, req in self._requests.items()
+                if rid not in self._assigned and rid not in self._dead
+            ]
+            ack_payload = self._acks_ready
+            self._acks_ready = []
+            assign_payload = self._publish
+            self._publish = {}
+            state_payload = {
+                "ready": tuple(self._data_ready),
+                "failed": dict(self._failed),
+                "freed": tuple(self._freed_pending),
+            }
+            self._freed_pending = []
+            inflight = len(self._slots) if self.is_owner else 0
+
+        payload = {
+            "rank": self.rank,
+            "req": pending,
+            "ack": ack_payload,
+            "assign": assign_payload,
+            "state": state_payload if self.is_owner else None,
+            "inflight": inflight,
+        }
+        gathered = [None] * self.world_size
+        torch.distributed.all_gather_object(
+            gathered, payload, group=self.group.cpu_group
+        )
+
+        # ---- merge ---------------------------------------------------- #
+        all_reqs: List[Tuple[str, int]] = []
+        states = None
+        for item in gathered:
+            if not item:
+                continue
+            all_reqs.extend(item["req"])
+            if self.is_owner:
+                # Ack tally is owner-side state; peers would only grow it.
+                for rid in item["ack"]:
+                    self._acks_seen.setdefault(rid, set()).add(item["rank"])
+            for rid, assignment in (item["assign"] or {}).items():
+                self._adopt(rid, assignment)
+            if item["state"] is not None:
+                states = item["state"]
+
+        if states is not None and not self.is_owner:
+            with self._lock:
+                self._data_ready.update(states["ready"])
+                for rid, reason in states["failed"].items():
+                    self._failed.setdefault(rid, reason)
+                for rid in states.get("freed", ()):
+                    self._data_ready.discard(rid)
+                    self._failed.pop(rid, None)
+                    self._assigned.pop(rid, None)
+
+        if self.is_owner:
+            self._owner_allocate(all_reqs)
+            self._owner_reap()
+            self._prune_state()
+        else:
+            self._fail_dead_requests()
+            self._prune_state()
+        self._maybe_log_stats()
+
+    def _prune_state(self) -> None:
+        """Bound the per-rid state a long-running server accumulates.
+
+        ``_dead`` only guards against a re-allocation that can never happen;
+        ``_failed`` only serves receive threads polling right now. Both are
+        capped so days of traffic cannot bloat the tick payload.
+        """
+        with self._lock:
+            while len(self._dead_order) > _STATE_KEEP:
+                self._dead.discard(self._dead_order.pop(0))
+            if len(self._failed) > _STATE_KEEP:
+                excess = len(self._failed) - _STATE_KEEP
+                for rid in list(self._failed)[:excess]:
+                    self._failed.pop(rid, None)
+
+    def _adopt(self, rid: str, assignment: Tuple[int, int]) -> None:
+        with self._lock:
+            self._assigned[rid] = assignment
+            req = self._requests.get(rid)
+            if req is not None:
+                req.resolve(*assignment)
+
+    def _owner_allocate(self, reqs: List[Tuple[str, int]]) -> None:
+        max_inflight = envs.SGLANG_EMBEDDING_POOL_MAX_INFLIGHT.get()
+        now = time.monotonic()
+        # Big first: fewer holes when 6MB and 318MB requests interleave.
+        for rid, nbytes in sorted(reqs, key=lambda item: (-item[1], item[0])):
+            with self._lock:
+                if (
+                    rid in self._slots
+                    or rid in self._dead
+                    or rid in self._publish
+                    or rid in self._assigned
+                ):
+                    continue
+                if max_inflight and len(self._slots) >= max_inflight:
+                    self._pending_since.setdefault(rid, now)
+                    self._expire_pending_locked(rid, now)
+                    continue
+                offset = self._try_alloc_locked(nbytes)
+                if offset is None:
+                    if rid not in self._pending_since:
+                        self._pending_since[rid] = now
+                        self._alloc_waits += 1
+                        logger.warning(
+                            "SharedEmbeddingArena full: %dMB in %d slots; "
+                            "queueing %dMB (rid=%s)",
+                            self._total_inflight // (1024 * 1024),
+                            len(self._slots),
+                            nbytes // (1024 * 1024),
+                            rid,
+                        )
+                    self._expire_pending_locked(rid, now)
+                    continue
+                self._pending_since.pop(rid, None)
+                slot = _Slot(offset=offset, nbytes=nbytes, rid=rid, allocated_at=now)
+                self._slots[rid] = slot
+                self._assigned[rid] = (offset, nbytes)
+                self._publish[rid] = (offset, nbytes)
+                self._acks_seen.setdefault(rid, set())
+                self._total_inflight += _align_up(nbytes, _ALIGN)
+                if self._total_inflight > self._peak_inflight:
+                    bucket = self._total_inflight // (512 * 1024 * 1024)
+                    if bucket > self._peak_inflight // (512 * 1024 * 1024):
+                        logger.info(
+                            "SharedEmbeddingArena high-watermark: %dMB of %dMB "
+                            "(%d slots)",
+                            self._total_inflight // (1024 * 1024),
+                            self.size_bytes // (1024 * 1024),
+                            len(self._slots),
+                        )
+                    self._peak_inflight = self._total_inflight
+            self._resolve_local_request(rid, nbytes)
+
+    def _expire_pending_locked(self, rid: str, now: float) -> None:
+        started = self._pending_since.get(rid)
+        if started is None:
+            self._pending_since[rid] = now
+            return
+        timeout = envs.SGLANG_EMBEDDING_POOL_ALLOC_TIMEOUT_S.get()
+        if now - started > timeout:
+            self._pending_since.pop(rid, None)
+            self._failed[rid] = (
+                f"shared embedding arena full for {timeout:.0f}s "
+                f"(inflight={len(self._slots)}, cap={self.size_bytes // (1024 * 1024)}MB)"
+            )
+            self._alloc_timeouts += 1
+            req = self._requests.get(rid)
+            if req is not None:
+                req.fail(self._failed[rid])
+
+    def _resolve_local_request(self, rid: str, nbytes: int) -> None:
+        with self._lock:
+            req = self._requests.get(rid)
+        if req is not None and not req.event.is_set():
+            req.resolve(self._assigned[rid][0], nbytes)
+
+    def _fail_dead_requests(self) -> None:
+        with self._lock:
+            failed = dict(self._failed)
+        for rid, reason in failed.items():
+            req = self._requests.get(rid)
+            if req is not None and not req.event.is_set():
+                req.fail(reason)
+
+    def _owner_reap(self) -> None:
+        """Free slots every rank acknowledged, and force-free stale ones."""
+        ttl = envs.SGLANG_EMBEDDING_POOL_SLOT_TTL_S.get()
+        now = time.monotonic()
+        with self._lock:
+            for rid, slot in list(self._slots.items()):
+                acked = self._acks_seen.get(rid, set())
+                if len(acked) >= self.world_size:
+                    self._free_slot_locked(slot)
+                    self._acks_seen.pop(rid, None)
+                elif ttl > 0 and now - slot.allocated_at > ttl:
+                    # A rank that never acked is a bug, not a crash (a crash
+                    # takes the whole TP group down). The missing rank may
+                    # still be blocked inside /send, so its RDMA write could
+                    # land at any time: abandon the range for good instead of
+                    # handing it to the next request.
+                    self._force_frees += 1
+                    self._abandoned_bytes += _align_up(slot.nbytes, _ALIGN)
+                    logger.error(
+                        "SharedEmbeddingArena: abandoning rid=%s after %.0fs "
+                        "(acks from %s of %d ranks); %dMB lost until restart",
+                        rid,
+                        now - slot.allocated_at,
+                        sorted(acked),
+                        self.world_size,
+                        self._abandoned_bytes // (1024 * 1024),
+                    )
+                    self._free_slot_locked(slot, reusable=False)
+                    self._acks_seen.pop(rid, None)
+                    self._dead.add(rid)
+                    self._dead_order.append(rid)
+
+    def _free_slot_locked(self, slot: _Slot, reusable: bool = True) -> None:
+        self._slots.pop(slot.rid, None)
+        self._data_ready.discard(slot.rid)
+        self._assigned.pop(slot.rid, None)
+        self._total_inflight -= _align_up(slot.nbytes, _ALIGN)
+        aligned = _align_up(slot.nbytes, _ALIGN)
+        if reusable:
+            delay = envs.SGLANG_EMBEDDING_POOL_REUSE_DELAY_S.get()
+            if delay > 0:
+                # A failed /send or a late ack can leave the NIC still writing
+                # into this range; quarantine keeps the next request out of it.
+                self._quarantine.append(
+                    (time.monotonic() + delay, slot.offset, aligned)
+                )
+            else:
+                self._insert_free_locked(slot.offset, aligned)
+        self._freed_pending.append(slot.rid)
+
+    # ------------------------------------------------------------------ #
+    # free list (owner only)
+    # ------------------------------------------------------------------ #
+    def _try_alloc_locked(self, nbytes: int) -> Optional[int]:
+        self._reap_quarantine_locked()
+        aligned = _align_up(nbytes, _ALIGN)
+        for index, (offset, length) in enumerate(self._free):
+            if length >= aligned:
+                if length == aligned:
+                    self._free.pop(index)
+                else:
+                    self._free[index] = (offset + aligned, length - aligned)
+                return offset
+        return None
+
+    def _reap_quarantine_locked(self) -> None:
+        if not self._quarantine:
+            return
+        now = time.monotonic()
+        still: List[Tuple[float, int, int]] = []
+        for ready_at, offset, length in self._quarantine:
+            if now >= ready_at:
+                self._insert_free_locked(offset, length)
+            else:
+                still.append((ready_at, offset, length))
+        self._quarantine = still
+
+    def _insert_free_locked(self, offset: int, length: int) -> None:
+        self._free.append((offset, length))
+        self._free.sort()
+        merged: List[Tuple[int, int]] = []
+        for seg_offset, seg_length in self._free:
+            if merged and merged[-1][0] + merged[-1][1] == seg_offset:
+                merged[-1] = (merged[-1][0], merged[-1][1] + seg_length)
+            else:
+                merged.append((seg_offset, seg_length))
+        self._free = merged
+
+    # ------------------------------------------------------------------ #
+    # ack bookkeeping
+    # ------------------------------------------------------------------ #
+    def _drain_acks(self) -> None:
+        with self._lock:
+            if self._ack_waiters:
+                still: List[Tuple[str, torch.cuda.Event]] = []
+                for rid, event in self._ack_waiters:
+                    if event.query():
+                        self._acks_ready.append(rid)
+                    else:
+                        still.append((rid, event))
+                self._ack_waiters = still
+
+    def _maybe_log_stats(self) -> None:
+        interval = envs.SGLANG_EMBEDDING_POOL_STATS_INTERVAL_S.get()
+        if interval <= 0:
+            return
+        now = time.monotonic()
+        if now - self._last_stats < interval:
+            return
+        self._last_stats = now
+        with self._lock:
+            logger.info(
+                "SharedEmbeddingArena stats: inflight=%dMB/%dMB slots=%d "
+                "free_segs=%d reqs=%d ack_waiters=%d peak=%dMB waits=%d "
+                "timeouts=%d force_frees=%d abandoned=%dMB owner=%s",
+                self._total_inflight // (1024 * 1024),
+                self.size_bytes // (1024 * 1024),
+                len(self._slots),
+                len(self._free),
+                len(self._requests),
+                len(self._ack_waiters),
+                self._peak_inflight // (1024 * 1024),
+                self._alloc_waits,
+                self._alloc_timeouts,
+                self._force_frees,
+                self._abandoned_bytes // (1024 * 1024),
+                self.is_owner,
+            )
+
+    # ------------------------------------------------------------------ #
+    # misc
+    # ------------------------------------------------------------------ #
+    @property
+    def on_host(self) -> bool:
+        return True
+
+    @property
+    def host_async(self) -> bool:
+        """Arena views are pinned, even though ``Tensor.is_pinned()`` says no."""
+        return self._host_async
+
+
+def _align_up(value: int, align: int) -> int:
+    return (value + align - 1) & ~(align - 1)

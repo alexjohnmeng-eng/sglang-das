@@ -376,6 +376,9 @@ class SendDestination:
     endpoint: str
     session_id: Optional[str] = None
     buffer_address: Optional[int] = None
+    # A sibling rank of a shared embedding arena only wants the completion ack:
+    # the owner already moved the bytes into the shared segment.
+    meta_only: bool = False
 
     @classmethod
     def from_host_port(
@@ -385,11 +388,13 @@ class SendDestination:
         *,
         session_id: Optional[str] = None,
         buffer_address: Optional[int] = None,
+        meta_only: bool = False,
     ) -> "SendDestination":
         return cls(
             endpoint=NetworkAddress(prefill_host, embedding_port).to_host_port_str(),
             session_id=session_id,
             buffer_address=buffer_address,
+            meta_only=meta_only,
         )
 
     @classmethod
@@ -450,6 +455,7 @@ class MooncakeDelivery(EncoderDelivery):
             session_id=destination.session_id,
             buffer_address=destination.buffer_address,
             url=destination.endpoint,
+            skip_transfer=destination.meta_only,
         )
 
     async def release(self, state: ReqState) -> None:
@@ -1968,6 +1974,7 @@ class MMEncoder:
         prefill_host=None,
         embedding_port=None,
         url=None,
+        skip_transfer: bool = False,
     ):
         if (
             envs.SGLANG_ENCODER_CHECK_NAN.get()
@@ -1980,7 +1987,18 @@ class MMEncoder:
                 mm_data.req_id,
                 tuple(embedding.shape),
             )
-        if get_disagg().encoder_transfer_backend == "mooncake":
+        if (
+            get_disagg().encoder_transfer_backend == "mooncake"
+            and skip_transfer
+        ):
+            # A sibling rank of a shared embedding arena: the owner already
+            # pushed the bytes into the shared segment, so only the completion
+            # ack (which carries shapes, offsets and hashes) is still needed.
+            logger.info(
+                "Mooncake meta-only send for req_id=%s (shared arena peer)",
+                mm_data.req_id,
+            )
+        elif get_disagg().encoder_transfer_backend == "mooncake":
             # Encode is synchronous, so mm_data was staged before /encode returned.
             req_id = mm_data.req_id
             if embedding is None:
@@ -2397,7 +2415,13 @@ class MMEncoder:
 
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
     async def send(
-        self, req_id, prefill_host, embedding_port, session_id=None, buffer_address=None
+        self,
+        req_id,
+        prefill_host,
+        embedding_port,
+        session_id=None,
+        buffer_address=None,
+        meta_only: bool = False,
     ):
         state = self.req_states.get(req_id)
         if state is None:
@@ -2415,6 +2439,7 @@ class MMEncoder:
                 embedding_port,
                 session_id=session_id,
                 buffer_address=buffer_address,
+                meta_only=meta_only,
             ),
         )
         return True

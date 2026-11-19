@@ -71,6 +71,10 @@ from sglang.srt.utils.network import (
 
 logger = logging.getLogger(__name__)
 
+# One-shot diagnostic: log the first bytes every rank sees in the shared
+# arena, so a broken mapping shows up immediately instead of as bad text.
+_shared_arena_head_logged = False
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -1526,12 +1530,50 @@ class WaitingRDMARequest(WaitingMMRequestBase):
         self._record_receive_error(*error)
         return False
 
+    async def _post_send_with_retry(self, session, url, payload, attempts: int = 2):
+        """POST /send, retrying once on a dropped connection.
+
+        A busy encoder can reset a connection (keep-alive close, worker churn).
+        /send is idempotent for a given req_id and destination address, so a
+        fresh attempt is safe and keeps a transient reset from failing a
+        request that is otherwise fine.
+        """
+        last_error = None
+        timeout = aiohttp.ClientTimeout(
+            total=envs.SGLANG_ENCODER_SEND_TIMEOUT_S.get()
+        )
+        for attempt in range(attempts):
+            try:
+                return await session.post(url, json=payload, timeout=timeout)
+            except aiohttp.ClientConnectionError as error:
+                last_error = error
+                if attempt + 1 < attempts:
+                    logger.warning(
+                        "Encoder /send connection error for rid=%s (attempt %d/%d): %s",
+                        self.rid,
+                        attempt + 1,
+                        attempts,
+                        error,
+                    )
+                    await asyncio.sleep(0.2)
+        raise last_error
+
     async def _pull_meta_and_receive_embedding(self):
         """Pull per-part sizes, allocate the landing buffer, then drive /send.
 
         The tokenizer owns /encode; part_idx numbering matches it because both
         derive it from the num_items_assigned frozen onto the request.
         """
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=envs.SGLANG_ENCODER_HTTP_TIMEOUT.get())
+        ) as session:
+            prepared = await self._pull_part_meta(session)
+            if prepared is None:
+                return
+            await self._receive_into_buffer(session, *prepared)
+
+    async def _pull_part_meta(self, session):
+        """Phase 1: per-part sizes, blocking until the encode publishes."""
         modalities = list(self.num_items_assigned.keys())
         _, modality_num_parts = calculate_modality_num_parts(
             modalities, self.num_items_assigned
@@ -1557,113 +1599,116 @@ class WaitingRDMARequest(WaitingMMRequestBase):
                 cum_idx += 1
             part_idx_offset += modality_num_parts[modality]
 
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=envs.SGLANG_ENCODER_HTTP_TIMEOUT.get())
-        ) as session:
-            # Phase 1: pull per-part sizes, blocking until the encode publishes.
-            tasks = [
-                session.post(
-                    f"{self.encoder_urls[r['encoder_idx']]}/scheduler_receive_meta_data",
-                    json={"req_id": r["req_id"], "part_idx": r["part_idx"]},
-                )
-                for r in encode_requests
-            ]
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
-            if not await self._check_encoder_responses(
-                responses, "/scheduler_receive_meta_data"
-            ):
-                return
-            response_json_list = [await r.json() for r in responses]
+        tasks = [
+            session.post(
+                f"{self.encoder_urls[r['encoder_idx']]}/scheduler_receive_meta_data",
+                json={"req_id": r["req_id"], "part_idx": r["part_idx"]},
+            )
+            for r in encode_requests
+        ]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        if not await self._check_encoder_responses(
+            responses, "/scheduler_receive_meta_data"
+        ):
+            return None
+        response_json_list = [await r.json() for r in responses]
 
-            # Sort by part_idx
-            embedding_sizes, response_sorted, total_bytes = (
-                _sort_responses_and_compute_total_bytes(
-                    response_json_list, total_num_parts
+        embedding_sizes, response_sorted, total_bytes = (
+            _sort_responses_and_compute_total_bytes(
+                response_json_list, total_num_parts
+            )
+        )
+        return encode_requests, embedding_sizes, response_sorted, total_bytes
+
+    async def _receive_into_buffer(
+        self, session, encode_requests, embedding_sizes, response_sorted, total_bytes
+    ):
+        """Phase 2/3: allocate this rank's landing buffer and drive /send."""
+        total_num_parts = len(embedding_sizes)
+        if total_bytes > 0:
+            if self.embedding_pool is not None:
+                alloc_result = await asyncio.to_thread(
+                    self.embedding_pool.alloc, total_bytes
+                )
+                if alloc_result is None:
+                    # Oversize or alloc timeout — fatal for this request.
+                    self._record_receive_error(
+                        f"EmbeddingPool could not allocate "
+                        f"{total_bytes // (1024 * 1024)}MB (oversize or "
+                        f"timeout). Raise SGLANG_EMBEDDING_POOL_SIZE_MB."
+                    )
+                    return
+                pool_view, buffer_address, slot_id = alloc_result
+                with self._buffer_lock:
+                    self.embeddings_buffer = pool_view
+                    self._pool_slot_id = slot_id
+                logger.info(
+                    f"Pool-allocated Mooncake landing buffer "
+                    f"(host={getattr(self.embedding_pool, 'on_host', False)}): "
+                    f"rid={self.rid}, size={total_bytes}, "
+                    f"addr={buffer_address}, slot={slot_id}"
+                )
+            else:
+                gpu_buffer = torch.empty(
+                    total_bytes, dtype=torch.uint8, device=f"cuda:{self.gpu_id}"
+                )
+                self.embeddings_engine.register(
+                    gpu_buffer.data_ptr(), gpu_buffer.nbytes
+                )
+                buffer_address = gpu_buffer.data_ptr()
+                with self._buffer_lock:
+                    self.embeddings_buffer = gpu_buffer
+                logger.info(
+                    f"Per-request registered Mooncake GPU landing buffer "
+                    f"(pool disabled): rid={self.rid}, size={total_bytes}, "
+                    f"addr={buffer_address}"
+                )
+        else:
+            self.embeddings_buffer = None
+            buffer_address = 0
+
+        # Abort/timeout may have latched _terminal; don't start RDMA into
+        # a buffer that will be released when this thread exits.
+        with self._buffer_lock:
+            if self._terminal:
+                return
+
+        # Phase 2 cont: POST /send. Metadata carries no routing, so the
+        # shard comes from our own part map.
+        encoder_idx_by_part = {
+            r["part_idx"]: r["encoder_idx"] for r in encode_requests
+        }
+        offset = 0
+        send_tasks = []
+        for idx in range(total_num_parts):
+            rj = response_sorted[idx]
+            rj.update(
+                {
+                    "prefill_host": self.host_name,
+                    "embedding_port": self.embedding_port,
+                    "session_id": self.embeddings_engine.session_id,
+                    "buffer_address": offset + buffer_address,
+                    # Frees the embedding once all of us have taken it.
+                    "receive_count": self.receive_count,
+                }
+            )
+            send_tasks.append(
+                # Bounded on purpose: a stuck /send holds this rank's slot for
+                # the generic encoder timeout (30 min) otherwise. A dropped
+                # connection gets one fresh attempt.
+                self._post_send_with_retry(
+                    session,
+                    f"{self.encoder_urls[encoder_idx_by_part[idx]]}/send",
+                    rj,
                 )
             )
+            offset += embedding_sizes[idx]
 
-            # Phase 2: Pre-allocate GPU landing buffer.
-            # Prefer the pre-registered persistent pool when available; this avoids
-            # per-request register/deregister and keeps the encoder's openSegment
-            if total_bytes > 0:
-                if self.embedding_pool is not None:
-                    alloc_result = await asyncio.to_thread(
-                        self.embedding_pool.alloc, total_bytes
-                    )
-                    if alloc_result is None:
-                        # Oversize or alloc timeout — fatal for this request.
-                        self._record_receive_error(
-                            f"EmbeddingPool could not allocate "
-                            f"{total_bytes // (1024 * 1024)}MB (oversize or "
-                            f"timeout). Raise SGLANG_EMBEDDING_POOL_SIZE_MB."
-                        )
-                        return
-                    pool_view, buffer_address, slot_id = alloc_result
-                    with self._buffer_lock:
-                        self.embeddings_buffer = pool_view
-                        self._pool_slot_id = slot_id
-                    logger.info(
-                        f"Pool-allocated Mooncake GPU landing buffer: "
-                        f"rid={self.rid}, size={total_bytes}, "
-                        f"addr={buffer_address}, slot={slot_id}"
-                    )
-                else:
-                    gpu_buffer = torch.empty(
-                        total_bytes, dtype=torch.uint8, device=f"cuda:{self.gpu_id}"
-                    )
-                    self.embeddings_engine.register(
-                        gpu_buffer.data_ptr(), gpu_buffer.nbytes
-                    )
-                    buffer_address = gpu_buffer.data_ptr()
-                    with self._buffer_lock:
-                        self.embeddings_buffer = gpu_buffer
-                    logger.info(
-                        f"Per-request registered Mooncake GPU landing buffer "
-                        f"(pool disabled): rid={self.rid}, size={total_bytes}, "
-                        f"addr={buffer_address}"
-                    )
-            else:
-                self.embeddings_buffer = None
-                buffer_address = 0
-
-            # Abort/timeout may have latched _terminal; don't start RDMA into
-            # a buffer that will be released when this thread exits.
-            with self._buffer_lock:
-                if self._terminal:
-                    return
-
-            # Phase 2 cont: POST /send. Metadata carries no routing, so the
-            # shard comes from our own part map.
-            encoder_idx_by_part = {
-                r["part_idx"]: r["encoder_idx"] for r in encode_requests
-            }
-            offset = 0
-            send_tasks = []
-            for idx in range(total_num_parts):
-                rj = response_sorted[idx]
-                rj.update(
-                    {
-                        "prefill_host": self.host_name,
-                        "embedding_port": self.embedding_port,
-                        "session_id": self.embeddings_engine.session_id,
-                        "buffer_address": offset + buffer_address,
-                        # Frees the embedding once all of us have taken it.
-                        "receive_count": self.receive_count,
-                    }
-                )
-                send_tasks.append(
-                    session.post(
-                        f"{self.encoder_urls[encoder_idx_by_part[idx]]}/send",
-                        json=rj,
-                    )
-                )
-                offset += embedding_sizes[idx]
-
-            # Phase 3: Wait for RDMA transfers to complete
-            send_responses = await asyncio.gather(*send_tasks, return_exceptions=True)
-            if not await self._check_encoder_responses(send_responses, "/send"):
-                return
-            logger.info(f"RDMA transfers completed for rid={self.rid}")
+        # Phase 3: Wait for RDMA transfers to complete
+        send_responses = await asyncio.gather(*send_tasks, return_exceptions=True)
+        if not await self._check_encoder_responses(send_responses, "/send"):
+            return
+        logger.info(f"RDMA transfers completed for rid={self.rid}")
 
     def _extract_embedding_from_buffer(self, recv_obj, parts) -> None:
         # The embedding already landed in the pre-registered GPU buffer via
@@ -1704,6 +1749,193 @@ class WaitingRDMARequest(WaitingMMRequestBase):
             except Exception:
                 logger.exception("Failed to deregister GPU buffer for rid=%s", self.rid)
         self.embeddings_buffer = None
+
+
+class SharedWaitingRDMARequest(WaitingRDMARequest):
+    """Mooncake receive against the cross-process shared host arena.
+
+    The owner (rank 0) posts the real ``/send``, so the encoder performs one
+    RDMA write for the whole TP group. Every other rank posts a metadata-only
+    ``/send`` -- it still needs the completion ack that carries shapes, offsets
+    and item hashes -- and waits for the owner's DATA_READY before assembling
+    from its own mapping of the same physical pages.
+
+    Slot ownership: ``_pool_slot_id`` is the request id, and ``embedding_pool``
+    is the arena, whose ``release``/``release_on_gc`` acknowledge the slot once
+    this rank's reads are fenced. The lease machinery above is unchanged.
+    """
+
+    def __init__(self, *args, shared_arena, is_owner: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.arena = shared_arena
+        self._is_owner = is_owner
+        # True once a slot was requested; assembly must then wait for the
+        # owner's DATA_READY, not just for the metadata acks.
+        self._expects_buffer = False
+        self._failed_acked = False
+
+    def _ack_once(self) -> None:
+        """Tell the owner this rank is done with the request (idempotent)."""
+        if self._failed_acked:
+            return
+        self._failed_acked = True
+        try:
+            self.arena.release(self.rid)
+        except Exception:
+            logger.exception(
+                "Shared arena: failed to acknowledge rid=%s", self.rid
+            )
+
+    def release_resources(self):
+        """A failed request still has to acknowledge, even if it never got a
+        slot: the owner only frees once every rank of the group answered.
+
+        A rank that already owns a slot must not ack here: its receive thread
+        may still have an RDMA write (owner) or a chunk copy (peer) in flight,
+        and the base class defers that release to the thread's exit or to
+        ``_cleanup_gpu_buffer``, which knows when the buffer is idle.
+        """
+        super().release_resources()
+        with self._buffer_lock:
+            owns_buffer = self._pool_slot_id is not None or self._receive_running
+        if not owns_buffer:
+            self._ack_once()
+
+    def _run_receive_in_thread(self):
+        try:
+            super()._run_receive_in_thread()
+        finally:
+            # The thread owns the buffer while it runs. Once it is gone, a
+            # rank that never held a slot and cannot be reached by the lease
+            # path must still acknowledge, or the owner only frees the slot
+            # when the TTL expires.
+            if self.status in (
+                WaitingMMRequestStatus.FAIL,
+                WaitingMMRequestStatus.TIMEOUT,
+            ):
+                with self._buffer_lock:
+                    owns_buffer = (
+                        self._pool_slot_id is not None
+                        or self.embeddings_buffer is not None
+                    )
+                if not owns_buffer:
+                    self._ack_once()
+
+    async def _receive_into_buffer(
+        self, session, encode_requests, embedding_sizes, response_sorted, total_bytes
+    ):
+        total_num_parts = len(embedding_sizes)
+        buffer_address = 0
+        if total_bytes > 0:
+            self._expects_buffer = True
+            assign = await asyncio.to_thread(
+                self.arena.request_slot, self.rid, total_bytes
+            )
+            if assign is None:
+                reason = (
+                    f"SharedEmbeddingArena could not allocate "
+                    f"{total_bytes // (1024 * 1024)}MB for rid={self.rid}"
+                )
+                self.arena.mark_failed(self.rid, reason)
+                self._record_receive_error(reason)
+                return
+            slot_offset, _ = assign
+            with self._buffer_lock:
+                self.embeddings_buffer = self.arena.view(slot_offset, total_bytes)
+                self._pool_slot_id = self.rid
+            if self._is_owner:
+                # Only the owner's address is registered with mooncake.
+                buffer_address = self.arena.base + slot_offset
+            logger.info(
+                "Shared arena slot: rid=%s size=%dMB offset=%d owner=%s",
+                self.rid,
+                total_bytes // (1024 * 1024),
+                slot_offset,
+                self._is_owner,
+            )
+        else:
+            self.embeddings_buffer = None
+
+        # Abort/timeout may have latched _terminal; don't start RDMA into
+        # a buffer that will be released when this thread exits.
+        with self._buffer_lock:
+            if self._terminal:
+                return
+
+        encoder_idx_by_part = {
+            r["part_idx"]: r["encoder_idx"] for r in encode_requests
+        }
+        offset = 0
+        send_tasks = []
+        for idx in range(total_num_parts):
+            rj = response_sorted[idx]
+            rj.update(
+                {
+                    "prefill_host": self.host_name,
+                    "embedding_port": self.embedding_port,
+                    "session_id": self.embeddings_engine.session_id,
+                    "buffer_address": offset + buffer_address,
+                    "receive_count": self.receive_count,
+                }
+            )
+            if not self._is_owner:
+                # Peer: metadata ack only, the owner moves the bytes.
+                rj["meta_only"] = True
+            send_tasks.append(
+                # Bounded on purpose: a stuck /send holds this rank's slot for
+                # the generic encoder timeout (30 min) otherwise. A dropped
+                # connection gets one fresh attempt.
+                self._post_send_with_retry(
+                    session,
+                    f"{self.encoder_urls[encoder_idx_by_part[idx]]}/send",
+                    rj,
+                )
+            )
+            offset += embedding_sizes[idx]
+
+        send_responses = await asyncio.gather(*send_tasks, return_exceptions=True)
+        if not await self._check_encoder_responses(send_responses, "/send"):
+            self.arena.mark_failed(self.rid, "encoder /send failed")
+            return
+
+        if total_bytes <= 0:
+            return
+        if self._is_owner:
+            # The transfer completed inside /send; publish it for the peers.
+            self.arena.mark_data_ready(self.rid)
+            logger.info(
+                "Shared arena RDMA landed: rid=%s size=%dMB",
+                self.rid,
+                total_bytes // (1024 * 1024),
+            )
+        else:
+            timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
+            if not await asyncio.to_thread(
+                self.arena.wait_data_ready, self.rid, timeout
+            ):
+                reason = self.arena.failure_reason(self.rid)
+                self._record_receive_error(reason)
+                return
+
+        # One-time proof that every rank's mapping sees the owner's bytes.
+        global _shared_arena_head_logged
+        if not _shared_arena_head_logged and self.embeddings_buffer is not None:
+            _shared_arena_head_logged = True
+            logger.info(
+                "Shared arena view check: rid=%s owner=%s head=%s",
+                self.rid,
+                self._is_owner,
+                self.embeddings_buffer[:16].tolist(),
+            )
+
+    def _prepare_embedding_buffer(self) -> bool:
+        # Assembly must not read the slot before the owner's RDMA committed,
+        # and must not run before this rank's own slot assignment arrived.
+        if not self._expects_buffer:
+            return True
+        return self.embeddings_buffer is not None and self.arena.is_data_ready(
+            self.rid
+        )
 
 
 def _release_glm_received_part(pool, engine, buffer, slot):
@@ -2266,6 +2498,9 @@ class MMReceiverBase(ABC):
         self.gpu_id = get_device().gpu_id if scheduler is not None else 0
         self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
         self.embedding_pool = None
+        # Set only when SGLANG_EMBEDDING_POOL_SHARING=hsa_ipc; then
+        # self.embedding_pool is the same object (duck-typed for the leases).
+        self.shared_arena = None
 
         self.model_type = (
             getattr(hf_config, "model_type", "").lower()
@@ -2295,18 +2530,55 @@ class MMReceiverBase(ABC):
             ):
                 pool_mb = envs.SGLANG_MC_RDMA_POOL_MAX_MB.get()
             if pool_mb and pool_mb > 0 and scheduler is not None:
-                try:
-                    self.embedding_pool = EmbeddingPool(
-                        self.gpu_id,
-                        pool_mb * 1024 * 1024,
+                sharing = (
+                    envs.SGLANG_EMBEDDING_POOL_SHARING.get() or "off"
+                ).strip().lower()
+                if sharing == "hsa_ipc":
+                    # One pinned host arena per node, mapped by every rank.
+                    # This is a collective allocation: every rank must enter.
+                    if not self._shared_arena_supported():
+                        raise ValueError(
+                            "SGLANG_EMBEDDING_POOL_SHARING=hsa_ipc requires a "
+                            f"single-node group with tp_size > 1 "
+                            f"(tp_size={self.tp_size}, nnodes={self.nnodes})"
+                        )
+                    if "glm" in (self.model_type or ""):
+                        # GLM has its own per-part receive protocol; the shared
+                        # path replaces that waiting class and would silently
+                        # mis-assemble its parts.
+                        raise ValueError(
+                            "SGLANG_EMBEDDING_POOL_SHARING=hsa_ipc is not "
+                            "supported for GLM models"
+                        )
+                    from sglang.srt.disaggregation.encoder.shared_arena import (
+                        SharedEmbeddingArena,
+                    )
+
+                    self.shared_arena = SharedEmbeddingArena(
+                        group=self.tp_group,
+                        rank_in_group=self.tp_rank,
+                        size_bytes=pool_mb * 1024 * 1024,
                         engine=self.embeddings_engine,
                     )
-                except Exception:
-                    logger.exception(
-                        "Failed to allocate EmbeddingPool, "
-                        "falling back to per-request register"
+                    self.embedding_pool = self.shared_arena
+                elif sharing != "off":
+                    raise ValueError(
+                        "SGLANG_EMBEDDING_POOL_SHARING must be 'off' or "
+                        f"'hsa_ipc', got {sharing!r}"
                     )
-                    self.embedding_pool = None
+                else:
+                    try:
+                        self.embedding_pool = EmbeddingPool(
+                            self.gpu_id,
+                            pool_mb * 1024 * 1024,
+                            engine=self.embeddings_engine,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to allocate EmbeddingPool, "
+                            "falling back to per-request register"
+                        )
+                        self.embedding_pool = None
             if hf_config is not None:
                 self._init_mm_processor(server_args, hf_config)
         elif self.encoder_transfer_backend == "zmq_to_scheduler":
@@ -2336,6 +2608,15 @@ class MMReceiverBase(ABC):
                         else None
                     ),
                 )
+
+    def _shared_arena_supported(self) -> bool:
+        """HSA IPC shares physical pages between local processes only."""
+        return (
+            self.tp_group is not None
+            and self.nnodes == 1
+            and self.tp_size > 1
+            and self.tp_rank is not None
+        )
 
     def _init_mm_processor(
         self,
@@ -3101,6 +3382,20 @@ class MMReceiverHTTP(MMReceiverBase):
     # For zmq_to_scheduler and mooncake
     def process_waiting_requests(self, recv_reqs):
         if self.encoder_transfer_backend == "mooncake":
+            if self.shared_arena is not None:
+                # Every rank runs this once per scheduler iteration, so it is
+                # also the collective that carries slot assignments and acks.
+                self.shared_arena.tick()
+                return self._process_waiting_requests(
+                    recv_reqs,
+                    SharedWaitingRDMARequest,
+                    embeddings_engine=self.embeddings_engine,
+                    dtype=self.dtype,
+                    gpu_id=self.gpu_id,
+                    embedding_pool=self.shared_arena,
+                    shared_arena=self.shared_arena,
+                    is_owner=self.shared_arena.is_owner,
+                )
             return self._process_waiting_requests(
                 recv_reqs,
                 GlmWaitingRDMARequest
