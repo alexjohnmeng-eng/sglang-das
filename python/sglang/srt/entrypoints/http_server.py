@@ -731,8 +731,6 @@ async def ready() -> Response:
     return Response(status_code=status_code)
 
 
-@app.get("/health")
-@app.get("/health_generate")
 async def _drop_health_requests(
     tokenizer_manager, tasks, health_requests, gather=None
 ) -> None:
@@ -770,6 +768,8 @@ async def _drop_health_requests(
             tokenizer_manager.rid_to_state.pop(rid, None)
 
 
+@app.get("/health")
+@app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
     """
     Check the health of the inference server by sending a special request to generate one token.

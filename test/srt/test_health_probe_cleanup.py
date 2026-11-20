@@ -124,3 +124,18 @@ def test_unpatched_pattern_leaks_the_cancelled_gather():
     for _ in range(3):
         gc.collect()
     assert any("never retrieved" in message for message in reported), reported
+
+
+def test_health_routes_point_at_the_handler():
+    """The /health routes must not be captured by a module-level helper.
+
+    Moving code around previously left the route decorators attached to the
+    drop helper, so FastAPI answered /health with a 400 listing 'tokenizer_manager'
+    and 'tasks' as missing query parameters.
+    """
+    from sglang.srt.entrypoints import http_server as hs
+
+    routes = {r.path: r.endpoint for r in hs.app.routes if hasattr(r, "path")}
+    assert routes["/health"] is hs.health_generate
+    assert routes["/health_generate"] is hs.health_generate
+    assert hs._drop_health_requests not in set(routes.values())
