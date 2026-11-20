@@ -97,3 +97,30 @@ def test_drop_abort_failure_does_not_escape():
         assert tm.rid_to_state == {}
 
     asyncio.run(scenario())
+
+
+def test_unpatched_pattern_leaks_the_cancelled_gather():
+    """Shows the failure the fix removes, without a live server.
+
+    The old handler cancelled the probe tasks and returned without awaiting
+    the gather; the cancelled _GatheringFuture is then collected with its
+    exception never retrieved, which the event loop reports exactly as the
+    production log did.
+    """
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        reported = []
+        loop.set_exception_handler(lambda _l, ctx: reported.append(ctx.get("message", "")))
+        tasks = [asyncio.create_task(asyncio.sleep(30)) for _ in range(2)]
+        gather = asyncio.gather(*tasks)
+        await asyncio.sleep(0)
+        for task in tasks:
+            task.cancel()
+        gather.cancel()
+        return reported
+
+    reported = asyncio.run(scenario())
+    for _ in range(3):
+        gc.collect()
+    assert any("never retrieved" in message for message in reported), reported
