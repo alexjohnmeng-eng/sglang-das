@@ -733,6 +733,43 @@ async def ready() -> Response:
 
 @app.get("/health")
 @app.get("/health_generate")
+async def _drop_health_requests(
+    tokenizer_manager, tasks, health_requests, gather=None
+) -> None:
+    """Cancel health probes and leave nothing behind.
+
+    ``generate_request`` aborts requests that already reached the scheduler,
+    but only while their ``rid_to_state`` entry is still registered, so the
+    cancelled tasks must finish their cleanup before the handler starts
+    dropping entries. The gather that observed those tasks also has to be
+    awaited: a cancelled gather left to the garbage collector is reported as
+    "asyncio: _GatheringFuture exception was never retrieved".
+    """
+    for task in tasks:
+        task.cancel()
+    if gather is not None:
+        gather.cancel()
+        try:
+            await gather
+        except BaseException:
+            pass
+    elif tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    for gri in health_requests:
+        rids = gri.rid if isinstance(gri.rid, list) else [gri.rid]
+        for rid in rids:
+            if rid not in tokenizer_manager.rid_to_state:
+                continue
+            # A probe that never made it through the cleanup still has its
+            # request admitted (and, in PD mode, preallocated on the decode
+            # side): abort it before dropping the state.
+            try:
+                tokenizer_manager.abort_request(rid)
+            except Exception:
+                logger.exception("Health check abort failed for %s", rid)
+            tokenizer_manager.rid_to_state.pop(rid, None)
+
+
 async def health_generate(request: Request) -> Response:
     """
     Check the health of the inference server by sending a special request to generate one token.
@@ -832,13 +869,10 @@ async def health_generate(request: Request) -> Response:
     # the first detokenizer heartbeat and cancelling a peer mid-collective.
     if health_dp_size > 1:
 
-        def drop_health_requests():
-            for task in tasks:
-                task.cancel()
-            for gri in health_requests:
-                rids = gri.rid if isinstance(gri.rid, list) else [gri.rid]
-                for rid in rids:
-                    tokenizer_manager.rid_to_state.pop(rid, None)
+        async def drop_health_requests(gather=None):
+            await _drop_health_requests(
+                tokenizer_manager, tasks, health_requests, gather
+            )
 
         def serving_user_requests():
             return any(
@@ -866,12 +900,12 @@ async def health_generate(request: Request) -> Response:
                 serving_user_requests()
                 and tokenizer_manager.last_receive_tstamp > tic
             ):
-                drop_health_requests()
+                await drop_health_requests(fan_out)
                 tokenizer_manager.server_status = ServerStatus.Up
                 return Response(status_code=200)
             if time.time() >= tic + HEALTH_CHECK_TIMEOUT:
                 break
-        drop_health_requests()
+        await drop_health_requests(fan_out)
         tokenizer_manager.server_status = ServerStatus.UnHealthy
         logger.error(
             "DP-attention health check failed for %s ranks: no response within %ss",
@@ -887,10 +921,12 @@ async def health_generate(request: Request) -> Response:
         if tokenizer_manager.last_receive_tstamp > tic:
             tasks[0].cancel()
             tokenizer_manager.rid_to_state.pop(health_requests[0].rid, None)
+            await asyncio.gather(*tasks, return_exceptions=True)
             tokenizer_manager.server_status = ServerStatus.Up
             return Response(status_code=200)
 
     tasks[0].cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
     tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
     last_receive_time = time.strftime(
         "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
