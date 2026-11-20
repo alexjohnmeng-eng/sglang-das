@@ -1828,21 +1828,21 @@ class SharedWaitingRDMARequest(WaitingRDMARequest):
         try:
             super()._run_receive_in_thread()
         finally:
-            # The thread owns the buffer while it runs. Once it is gone, a
-            # rank that never held a slot and cannot be reached by the lease
-            # path must still acknowledge, or the owner only frees the slot
-            # when the TTL expires.
-            if self.status in (
-                WaitingMMRequestStatus.FAIL,
-                WaitingMMRequestStatus.TIMEOUT,
-            ):
-                with self._buffer_lock:
-                    owns_buffer = (
-                        self._pool_slot_id is not None
-                        or self.embeddings_buffer is not None
-                    )
-                if not owns_buffer:
-                    self._ack_once()
+            # The thread owns the buffer while it runs. Once it is gone and
+            # this rank holds no buffer, it can never read the arena for this
+            # rid again, so acknowledge unconditionally. Gating this on the
+            # terminal status lost acks: the scheduler thread can fail the
+            # request while this thread is still unwinding (status still
+            # PENDING here, and the scheduler saw _receive_running=True, so it
+            # did not ack either), and the owner then held the slot until TTL
+            # and abandoned it.
+            with self._buffer_lock:
+                owns_buffer = (
+                    self._pool_slot_id is not None
+                    or self.embeddings_buffer is not None
+                )
+            if not owns_buffer:
+                self._ack_once()
 
     async def _receive_into_buffer(
         self, session, encode_requests, embedding_sizes, response_sorted, total_bytes
