@@ -145,6 +145,12 @@ class SharedEmbeddingArena:
         self._alloc_timeouts = 0
         self._force_frees = 0
         self._abandoned_bytes = 0
+        # slots returned without the reuse delay (normal completions)
+        self._immediate_frees = 0
+        # tick collective cost, sampled when SGLANG_EMBEDDING_POOL_PROFILE=1
+        self._tick_ms_sum = 0.0
+        self._tick_ms_max = 0.0
+        self._tick_ms_n = 0
         self._last_stats = time.monotonic()
         # Monotonic count of tick() calls; identical on every rank because the
         # scheduler loop calls it once per iteration everywhere.
@@ -152,6 +158,9 @@ class SharedEmbeddingArena:
         # rids whose /send died without proof that the encoder stopped writing
         # (owner frees those slots permanently instead of recycling them)
         self._drain_unknown: Set[str] = set()
+        # rids at least one rank released without a safe-reuse proof; those
+        # still go through the reuse-delay quarantine
+        self._reuse_unsafe: Set[str] = set()
         # this rank's report of such rids, shipped on the next tick
         self._unsafe_acks: List[str] = []
 
@@ -258,6 +267,7 @@ class SharedEmbeddingArena:
         rid: str,
         ready_event: Optional[torch.cuda.Event] = None,
         drain_unknown: bool = False,
+        safe_reuse: bool = False,
     ) -> None:
         """Acknowledge a slot once this rank no longer reads it.
 
@@ -265,6 +275,12 @@ class SharedEmbeddingArena:
         finished (the /send died with a timeout or a dropped connection). The
         ack only covers the local reader, so the owner must retire the range
         permanently instead of putting it back in the free list.
+
+        ``safe_reuse`` marks the normal path: the request completed, its RDMA
+        write was proven by DATA_READY, and every reader is fenced by
+        ``ready_event``. The owner can then hand the range out again right
+        away instead of parking it in the reuse-delay quarantine, which would
+        otherwise tax every request 2s of arena capacity.
         """
         if ready_event is None and torch.cuda.is_available():
             # GC / abort path: fence conservatively on the current stream so a
@@ -282,9 +298,9 @@ class SharedEmbeddingArena:
             if drain_unknown:
                 self._unsafe_acks.append(rid)
             if ready_event is not None and not ready_event.query():
-                self._ack_waiters.append((rid, ready_event))
+                self._ack_waiters.append((rid, ready_event, safe_reuse))
             else:
-                self._acks_ready.append(rid)
+                self._acks_ready.append((rid, safe_reuse))
 
     def release_on_gc(self, obj, rid: str):
         return weakref.finalize(obj, self.release, rid)
@@ -292,6 +308,18 @@ class SharedEmbeddingArena:
     # ------------------------------------------------------------------ #
     # the per-iteration collective
     # ------------------------------------------------------------------ #
+    def _should_tick(self) -> bool:
+        """Advance the call counter and decide whether to enter the collective.
+
+        The answer depends only on this rank's call index, which is identical
+        on every rank because the scheduler loop calls ``tick`` once per
+        iteration everywhere. Any wall-clock or workload-dependent gate would
+        let ranks issue different collectives in the same slot.
+        """
+        self._tick_calls += 1
+        every = envs.SGLANG_EMBEDDING_POOL_TICK_EVERY.get()
+        return every <= 1 or (self._tick_calls % every) == 0
+
     def tick(self) -> None:
         """Exchange allocations / acknowledgements with the other ranks.
 
@@ -307,9 +335,7 @@ class SharedEmbeddingArena:
         them one tick later -- one scheduler iteration, against the hundreds
         of milliseconds an embedding transfer takes.
         """
-        self._tick_calls += 1
-        every = envs.SGLANG_EMBEDDING_POOL_TICK_EVERY.get()
-        if every > 1 and self._tick_calls % every:
+        if not self._should_tick():
             return
         self._drain_acks()
         with self._lock:
@@ -342,9 +368,25 @@ class SharedEmbeddingArena:
             "inflight": inflight,
         }
         gathered = [None] * self.world_size
+        t_gather = time.perf_counter()
         torch.distributed.all_gather_object(
             gathered, payload, group=self.group.cpu_group
         )
+        if envs.SGLANG_EMBEDDING_POOL_PROFILE.get():
+            gather_ms = (time.perf_counter() - t_gather) * 1000.0
+            self._tick_ms_sum += gather_ms
+            self._tick_ms_max = max(self._tick_ms_max, gather_ms)
+            self._tick_ms_n += 1
+            if self._tick_ms_n % 200 == 0:
+                logger.info(
+                    "[pool-profile] tick avg_ms=%.2f max_ms=%.2f n=%d "
+                    "pending=%d acks=%d",
+                    self._tick_ms_sum / self._tick_ms_n,
+                    self._tick_ms_max,
+                    self._tick_ms_n,
+                    len(pending),
+                    len(ack_payload),
+                )
 
         # ---- merge ---------------------------------------------------- #
         all_reqs: List[Tuple[str, int]] = []
@@ -355,12 +397,7 @@ class SharedEmbeddingArena:
             all_reqs.extend(item["req"])
             if self.is_owner:
                 # Ack tally is owner-side state; peers would only grow it.
-                for rid in item["ack"]:
-                    self._acks_seen.setdefault(rid, set()).add(item["rank"])
-                # A rank whose /send died without drain proof asks the owner to
-                # retire the range instead of recycling it.
-                for rid in item.get("unsafe", ()):
-                    self._drain_unknown.add(rid)
+                self._record_peer_ack(item["rank"], item["ack"], item.get("unsafe"))
             for rid, assignment in (item["assign"] or {}).items():
                 self._adopt(rid, assignment)
             if item["state"] is not None:
@@ -407,6 +444,28 @@ class SharedEmbeddingArena:
                         self._drain_unknown.discard(rid)
                     if len(self._drain_unknown) <= _STATE_KEEP:
                         break
+            if len(self._reuse_unsafe) > _STATE_KEEP:
+                for rid in list(self._reuse_unsafe):
+                    if rid not in self._slots:
+                        self._reuse_unsafe.discard(rid)
+                    if len(self._reuse_unsafe) <= _STATE_KEEP:
+                        break
+
+    def _record_peer_ack(self, rank: int, acks, unsafe) -> None:
+        """Fold one rank's tick payload into the owner's ack bookkeeping.
+
+        ``acks`` carries ``(rid, safe_reuse)`` pairs: a rank that could not
+        prove its release is safe (abort, GC, receive failure) makes the whole
+        group's range go through the reuse quarantine. ``unsafe`` lists rids
+        whose /send died without drain proof; those ranges are retired.
+        """
+        with self._lock:
+            for rid, safe_reuse in acks or ():
+                self._acks_seen.setdefault(rid, set()).add(rank)
+                if not safe_reuse:
+                    self._reuse_unsafe.add(rid)
+            for rid in unsafe or ():
+                self._drain_unknown.add(rid)
 
     def _adopt(self, rid: str, assignment: Tuple[int, int]) -> None:
         with self._lock:
@@ -525,10 +584,21 @@ class SharedEmbeddingArena:
                         self._free_slot_locked(slot, reusable=False)
                         self._dead.add(rid)
                         self._dead_order.append(rid)
-                    else:
+                    elif rid in self._reuse_unsafe:
+                        # Some rank released without the safe-reuse proof
+                        # (abort, GC, receive failure): keep the short
+                        # quarantine so a copy still in flight cannot be
+                        # overwritten.
                         self._free_slot_locked(slot)
+                    else:
+                        # Normal completion: the write was proven by
+                        # DATA_READY and every reader is fenced by its release
+                        # event, so the range is free immediately.
+                        self._free_slot_locked(slot, quarantine=False)
+                        self._immediate_frees += 1
                     self._acks_seen.pop(rid, None)
                     self._drain_unknown.discard(rid)
+                    self._reuse_unsafe.discard(rid)
                 elif ttl > 0 and now - slot.allocated_at > ttl:
                     # A rank that never acked is a bug, not a crash (a crash
                     # takes the whole TP group down). The missing rank may
@@ -552,14 +622,16 @@ class SharedEmbeddingArena:
                     self._dead.add(rid)
                     self._dead_order.append(rid)
 
-    def _free_slot_locked(self, slot: _Slot, reusable: bool = True) -> None:
+    def _free_slot_locked(
+        self, slot: _Slot, reusable: bool = True, quarantine: bool = True
+    ) -> None:
         self._slots.pop(slot.rid, None)
         self._data_ready.discard(slot.rid)
         self._assigned.pop(slot.rid, None)
         self._total_inflight -= _align_up(slot.nbytes, _ALIGN)
         aligned = _align_up(slot.nbytes, _ALIGN)
         if reusable:
-            delay = envs.SGLANG_EMBEDDING_POOL_REUSE_DELAY_S.get()
+            delay = envs.SGLANG_EMBEDDING_POOL_REUSE_DELAY_S.get() if quarantine else 0
             if delay > 0:
                 # A failed /send or a late ack can leave the NIC still writing
                 # into this range; quarantine keeps the next request out of it.
@@ -614,12 +686,12 @@ class SharedEmbeddingArena:
     def _drain_acks(self) -> None:
         with self._lock:
             if self._ack_waiters:
-                still: List[Tuple[str, torch.cuda.Event]] = []
-                for rid, event in self._ack_waiters:
+                still: List[Tuple[str, torch.cuda.Event, bool]] = []
+                for rid, event, safe_reuse in self._ack_waiters:
                     if event.query():
-                        self._acks_ready.append(rid)
+                        self._acks_ready.append((rid, safe_reuse))
                     else:
-                        still.append((rid, event))
+                        still.append((rid, event, safe_reuse))
                 self._ack_waiters = still
 
     def _maybe_log_stats(self) -> None:
@@ -634,7 +706,8 @@ class SharedEmbeddingArena:
             logger.info(
                 "SharedEmbeddingArena stats: inflight=%dMB/%dMB slots=%d "
                 "free_segs=%d reqs=%d ack_waiters=%d peak=%dMB waits=%d "
-                "timeouts=%d force_frees=%d abandoned=%dMB owner=%s",
+                "timeouts=%d force_frees=%d abandoned=%dMB "
+                "quarantine=%dMB immediate_frees=%d owner=%s",
                 self._total_inflight // (1024 * 1024),
                 self.size_bytes // (1024 * 1024),
                 len(self._slots),
@@ -646,6 +719,8 @@ class SharedEmbeddingArena:
                 self._alloc_timeouts,
                 self._force_frees,
                 self._abandoned_bytes // (1024 * 1024),
+                sum(length for _, _, length in self._quarantine) // (1024 * 1024),
+                self._immediate_frees,
                 self.is_owner,
             )
 

@@ -2335,11 +2335,18 @@ class EmbeddingPool:
         return None
 
     def release(
-        self, slot_id: int, ready_event: Optional[torch.cuda.Event] = None
+        self,
+        slot_id: int,
+        ready_event: Optional[torch.cuda.Event] = None,
+        safe_reuse: bool = False,
     ) -> None:
         """Return a previously-allocated slot to the free list and wake any
         blocked alloc() waiters. With ``ready_event``, the space is reused only
-        once the event has completed. Idempotent per slot_id."""
+        once the event has completed. Idempotent per slot_id.
+
+        ``safe_reuse`` is accepted for interface parity with the shared host
+        arena, which skips its reuse delay for normal completions; a device
+        pool has no quarantine, so it is ignored here."""
         with self._cond:
             seg = self._inflight.pop(slot_id, None)
             if seg is None:
@@ -2406,7 +2413,10 @@ class EmbeddingSlotLease:
 
 
 def _release_slot_after_last_use(pool, slot_id, last_use) -> None:
-    pool.release(slot_id, ready_event=last_use[0])
+    # The consumer releases only after its last read of the slot, fenced by the
+    # recorded event: the transfer completed and every reader is done, so a
+    # host arena may hand the range out again without the reuse delay.
+    pool.release(slot_id, ready_event=last_use[0], safe_reuse=True)
 
 
 def _attach_slot_leases(mm_inputs, leases: List[EmbeddingSlotLease]) -> None:

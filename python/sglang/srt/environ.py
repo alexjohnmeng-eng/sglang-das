@@ -1792,6 +1792,10 @@ class Envs:
     SGLANG_EMBEDDING_POOL_ABANDON_ON_SEND_FAILURE = EnvBool(True)
     # Debug: assert that the CP keep masks partition the multimodal rows.
     SGLANG_EMBEDDING_POOL_DEBUG_KEEP = EnvInt(0)
+    # 1 = log per-call timings/bytes of the host-embedding staging path
+    # (CP row selection, CPU gather, H2D, re-prefill clone) and the arena
+    # collective. Diagnostic only; leave 0 in production.
+    SGLANG_EMBEDDING_POOL_PROFILE = EnvInt(0)
     SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT = EnvInt(64)
 
     # ===================================================================

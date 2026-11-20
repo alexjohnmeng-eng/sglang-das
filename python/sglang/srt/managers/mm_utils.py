@@ -8,6 +8,7 @@ import mmap
 import os
 import pickle
 import sys
+import time
 from abc import abstractmethod
 from array import array
 from collections import defaultdict
@@ -63,6 +64,9 @@ from sglang.utils import logger
 # CP embedding staging hands over one row index per input_ids row; a mismatch
 # means an upstream rewrite changed the batch, so warn once and use identity.
 _row_index_mismatch_warned = False
+
+# (count, bytes, seconds) of persistent re-prefill copies, profile only.
+_clone_profile = [0, 0, 0.0]
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
@@ -446,6 +450,8 @@ def _scatter_mm_embedding(
     Returns the number of rows copied (0 means this rank had nothing to read).
     """
     num_src_rows = src.size(0)
+    profile = envs.SGLANG_EMBEDDING_POOL_PROFILE.get()
+    t_start = time.perf_counter() if profile else 0.0
     flat_mask = mask.view(-1)
     ranks = torch.cumsum(flat_mask, dim=0) - 1
     # False rows collapse into the discard slot num_src_rows; a mask/src
@@ -474,8 +480,12 @@ def _scatter_mm_embedding(
                 )
             row_index = torch.arange(flat_mask.numel(), device=flat_mask.device)
         # src rows follow mask order, so the same selection indexes both.
-        keep = keep_fn(row_index[flat_mask])
-        kept = int(keep.sum().item())
+        # One device->host transfer decides everything else: the row count and
+        # the gather indices are then computed on the CPU, without a second
+        # synchronisation for keep.sum().item().
+        keep_cpu = keep_fn(row_index[flat_mask]).cpu()
+        idx_cpu = keep_cpu.nonzero().flatten()
+        kept = int(idx_cpu.numel())
         if envs.SGLANG_EMBEDDING_POOL_DEBUG_KEEP.get() and torch.distributed.is_initialized():
             # Every rank keeps a disjoint slice of the same rows; a strategy
             # change that breaks that would otherwise corrupt output silently.
@@ -490,16 +500,25 @@ def _scatter_mm_embedding(
                 )
         if kept == 0:
             return 0
-        keep_cpu = keep.cpu()
-        staged = src[keep_cpu]
-        dest_rows = dest_rows[keep.to(dest.device)]
+        staged_cpu = src.index_select(0, idx_cpu)
+        dest_rows = dest_rows[keep_cpu.to(dest.device)]
         # Blocking copy: the gathered buffer is pageable and short-lived.
-        staged = staged.to(dest.device, dest.dtype)
+        staged = staged_cpu.to(dest.device, dest.dtype)
     else:
         staged = staged.to(dest.device, dest.dtype)
         kept = num_src_rows
 
     dest.index_copy_(0, dest_rows, staged)
+    if profile:
+        row_bytes = src.size(1) * src.element_size() if src.dim() > 1 else 0
+        logger.info(
+            "[pool-profile] scatter src=%s rows=%d kept=%d h2d=%.1fMB total_ms=%.2f",
+            "host" if src.is_cpu else "device",
+            num_src_rows,
+            kept,
+            kept * row_bytes / (1024 * 1024),
+            (time.perf_counter() - t_start) * 1000.0,
+        )
     return kept
 
 
@@ -734,7 +753,25 @@ def release_consumed_pool_slots(
                 # stream; the event below fences the slot reuse behind it.
                 stream = torch.cuda.current_stream()
                 if consumed:
+                    t_clone = time.perf_counter()
                     item.precomputed_embeddings = embedding.clone()
+                    if envs.SGLANG_EMBEDDING_POOL_PROFILE.get():
+                        # Aggregate: one line per item would dominate the very
+                        # path being measured under load.
+                        global _clone_profile
+                        _clone_profile[0] += 1
+                        _clone_profile[1] += (
+                            embedding.numel() * embedding.element_size()
+                        )
+                        _clone_profile[2] += time.perf_counter() - t_clone
+                        if _clone_profile[0] % 500 == 0:
+                            logger.info(
+                                "[pool-profile] re-prefill clone n=%d avg_ms=%.2f "
+                                "total_mb=%.1f",
+                                _clone_profile[0],
+                                _clone_profile[2] / _clone_profile[0] * 1000.0,
+                                _clone_profile[1] / (1024 * 1024),
+                            )
             if consumed:
                 # Released below; drop the lease so later chunks of the same
                 # request do not copy the embedding out a second time.
