@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
@@ -70,6 +71,92 @@ def get_embedding_chunk(
     embedding = embedding.reshape(-1, embedding.shape[-1])
     embedding_chunk = embedding[start_index:end_index]
     return embedding_chunk, start_index, end_index
+
+
+def _concat_or_view(chunks: List[torch.Tensor]) -> torch.Tensor:
+    """Concatenate chunks, or return one view when they are already adjacent.
+
+    The EPD receiver hands every item of a request a slice of the same host
+    buffer, in sequence, so the per-item chunks are consecutive slices of one
+    storage. Copying them together would add a full-buffer host-to-host copy
+    per rank per request for nothing; a strided view over the same rows is
+    equivalent and free.
+    """
+    merged = _adjacent_view(chunks)
+    profile = envs.SGLANG_EMBEDDING_POOL_PROFILE.get()
+    if merged is not None:
+        if profile:
+            logger.info(
+                "[pool-profile] precomputed view chunks=%d rows=%d bytes=%.1fMB",
+                len(chunks),
+                merged.shape[0],
+                merged.numel() * merged.element_size() / (1024 * 1024),
+            )
+        return merged
+    if profile:
+        total = sum(t.numel() * t.element_size() for t in chunks)
+        logger.info(
+            "[pool-profile] precomputed concat chunks=%d bytes=%.1fMB",
+            len(chunks),
+            total / (1024 * 1024),
+        )
+    return torch.concat(chunks)
+
+
+def _adjacent_view(chunks: List[torch.Tensor]) -> Optional[torch.Tensor]:
+    """One strided view if the chunks are an adjacent run of one CPU storage."""
+    base = chunks[0]
+    storage = base.untyped_storage()
+    if base.dim() != 2 or any(
+        not t.is_cpu
+        or t.dim() != 2
+        or t.dtype != base.dtype
+        or t.stride() != base.stride()
+        or t.untyped_storage().data_ptr() != storage.data_ptr()
+        for t in chunks
+    ):
+        if envs.SGLANG_EMBEDDING_POOL_PROFILE.get():
+            bad = next(
+                t
+                for t in chunks
+                if t.dim() != 2
+                or not t.is_cpu
+                or t.dtype != base.dtype
+                or t.stride() != base.stride()
+                or t.untyped_storage().data_ptr() != storage.data_ptr()
+            )
+            logger.info(
+                "[pool-profile] no-view: dim=%d cpu=%s dtype=%s stride=%s same_storage=%s",
+                bad.dim(),
+                bad.is_cpu,
+                bad.dtype,
+                tuple(bad.stride()),
+                bad.untyped_storage().data_ptr() == storage.data_ptr(),
+            )
+        return None
+    cols = base.shape[1]
+    # Items without image tokens contribute zero rows and may sit at any
+    # offset of the buffer; they cannot break the run of real chunks.
+    ordered = sorted((t for t in chunks if t.numel()), key=lambda t: t.storage_offset())
+    if not ordered:
+        return None
+    # The first chunk may start at any element offset of the shared buffer
+    # (the modality view begins where the encoder put it); only the run of
+    # chunk extents has to be gapless.
+    start = offset = ordered[0].storage_offset()
+    for chunk in ordered:
+        if chunk.storage_offset() != offset:
+            if envs.SGLANG_EMBEDDING_POOL_PROFILE.get():
+                logger.info(
+                    "[pool-profile] no-view: gap at offset=%d expected=%d rows=%d",
+                    chunk.storage_offset(),
+                    offset,
+                    chunk.shape[0],
+                )
+            return None
+        offset += chunk.numel()
+    rows = (offset - start) // cols
+    return base.new_empty(0).set_(storage, start, (rows, cols), (cols, 1))
 
 
 def _get_precomputed_embedding(
@@ -138,7 +225,7 @@ def _get_precomputed_embedding(
         result = (
             precomputed_embeddings[0]
             if len(precomputed_embeddings) == 1
-            else torch.concat(precomputed_embeddings)
+            else _concat_or_view(precomputed_embeddings)
         )
         # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
         result = result.reshape(-1, result.shape[-1])
