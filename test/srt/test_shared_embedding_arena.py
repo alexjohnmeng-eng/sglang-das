@@ -20,14 +20,18 @@ Run: pytest -q test/srt/test_shared_embedding_arena.py
 
 import asyncio
 import threading
+from collections import OrderedDict
 
+import aiohttp
 import pytest
 import torch
 
 from sglang.srt.disaggregation.encoder import shared_arena as sa
 from sglang.srt.disaggregation.encoder.receiver import (
     DuplicateEmbeddingPartError,
+    SharedWaitingRDMARequest,
     _aggregate_embedding_part,
+    _send_may_have_written,
 )
 from sglang.srt.disaggregation.encoder.server import (
     MMEncoder,
@@ -322,3 +326,87 @@ def test_duplicate_part_is_ignored():
     assert _aggregate_embedding_part(current, _FakePart(False), None) is current
     assert _aggregate_embedding_part(current, _FakePart(True), None) is current
     assert current.added == 1
+
+
+class _FakeArena:
+    def __init__(self):
+        self.releases = []
+
+    def release(self, rid, drain_unknown=False, **kwargs):
+        self.releases.append((rid, drain_unknown))
+
+
+def _bare_shared_request(**attrs):
+    """A SharedWaitingRDMARequest with only the fields release paths touch."""
+    import threading
+
+    req = object.__new__(SharedWaitingRDMARequest)
+    req.rid = "rid-1"
+    req._pool_slot_id = "rid-1"
+    req.embeddings_buffer = None
+    req._receive_running = False
+    req._failed_acked = False
+    req._drain_unknown = False
+    req._lease_bound = False
+    req.registration_future = None
+    req._mm_finalizer = None
+    req._buffer_lock = threading.Lock()
+    req.embedding_pool = None
+    req.arena = _FakeArena()
+    for key, value in attrs.items():
+        setattr(req, key, value)
+    return req
+
+
+def test_bound_lease_blocks_the_receive_thread_ack():
+    """The consumer, not the receive thread, owns a bound slot's release.
+
+    The scheduler may bind (and detach the buffer) before the receive thread
+    reaches its finally block; acking there frees the range while prefill is
+    still reading it through the lease.
+    """
+    req = _bare_shared_request(_pool_slot_id=None, _lease_bound=True)
+    assert req._should_ack_on_thread_exit() is False
+
+
+def test_unbound_request_still_acks_on_thread_exit():
+    req = _bare_shared_request(_pool_slot_id=None, _lease_bound=False)
+    assert req._should_ack_on_thread_exit() is True
+
+
+def test_bound_lease_release_resources_does_not_ack_twice():
+    req = _bare_shared_request(_pool_slot_id=None, _lease_bound=True)
+    req.release_resources()
+    assert req.arena.releases == []
+
+
+def test_failed_slot_acks_once_with_drain_unknown():
+    """Cleanup must not emit a plain ACK before the unsafe one."""
+    req = _bare_shared_request(_drain_unknown=True)
+    req._cleanup_gpu_buffer()
+    req.release_resources()
+    assert req.arena.releases == [("rid-1", True)]
+    assert req._pool_slot_id is None
+
+
+def test_send_may_have_written_classification():
+    class _Resp:
+        def __init__(self, status):
+            self.status = status
+
+    assert _send_may_have_written(asyncio.TimeoutError()) is True
+    assert _send_may_have_written(aiohttp.ClientConnectionError("reset")) is True
+    # The DP dispatcher reports a worker timeout as an HTTP 504 envelope.
+    assert _send_may_have_written(_Resp(504)) is True
+    assert _send_may_have_written(_Resp(500)) is True
+    assert _send_may_have_written(_Resp(400)) is False
+    assert _send_may_have_written(_Resp(200)) is False
+
+
+def test_send_tombstone_survives_request_release():
+    server = object.__new__(MMEncoder)
+    server._completed_sends = OrderedDict()
+    server._remember_completed_send("req-1", "ep|session=1|addr=4096|meta_only=0")
+    assert server._send_already_completed("req-1", "ep|session=1|addr=4096|meta_only=0")
+    assert not server._send_already_completed("req-1", "ep|session=2|addr=4096|meta_only=0")
+    assert not server._send_already_completed("req-2", "ep|session=1|addr=4096|meta_only=0")

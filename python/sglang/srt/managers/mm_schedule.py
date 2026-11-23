@@ -104,14 +104,23 @@ def _concat_or_view(chunks: List[torch.Tensor]) -> torch.Tensor:
 
 
 def _adjacent_view(chunks: List[torch.Tensor]) -> Optional[torch.Tensor]:
-    """One strided view if the chunks are an adjacent run of one CPU storage."""
+    """One strided view if the chunks are an adjacent run of one CPU storage.
+
+    The caller's chunk order is the logical order of the embedding rows (it
+    feeds the placeholder tokens in that order), so a view is only valid when
+    that order already is a gapless, row-contiguous run of the shared storage.
+    Reordering by physical offset or accepting strided chunks would silently
+    attach the wrong rows to the wrong tokens.
+    """
     base = chunks[0]
     storage = base.untyped_storage()
-    if base.dim() != 2 or any(
+    if base.dim() != 2 or not base.is_contiguous() or any(
         not t.is_cpu
         or t.dim() != 2
+        or not t.is_contiguous()
         or t.dtype != base.dtype
         or t.stride() != base.stride()
+        or t.shape[1] != base.shape[1]
         or t.untyped_storage().data_ptr() != storage.data_ptr()
         for t in chunks
     ):
@@ -120,14 +129,17 @@ def _adjacent_view(chunks: List[torch.Tensor]) -> Optional[torch.Tensor]:
                 t
                 for t in chunks
                 if t.dim() != 2
+                or not t.is_contiguous()
                 or not t.is_cpu
                 or t.dtype != base.dtype
                 or t.stride() != base.stride()
+                or t.shape[1] != base.shape[1]
                 or t.untyped_storage().data_ptr() != storage.data_ptr()
             )
             logger.info(
-                "[pool-profile] no-view: dim=%d cpu=%s dtype=%s stride=%s same_storage=%s",
+                "[pool-profile] no-view: dim=%d contig=%s cpu=%s dtype=%s stride=%s same_storage=%s",
                 bad.dim(),
+                bad.is_contiguous(),
                 bad.is_cpu,
                 bad.dtype,
                 tuple(bad.stride()),
@@ -136,8 +148,9 @@ def _adjacent_view(chunks: List[torch.Tensor]) -> Optional[torch.Tensor]:
         return None
     cols = base.shape[1]
     # Items without image tokens contribute zero rows and may sit at any
-    # offset of the buffer; they cannot break the run of real chunks.
-    ordered = sorted((t for t in chunks if t.numel()), key=lambda t: t.storage_offset())
+    # offset of the buffer; they cannot break the run of real chunks. Keep the
+    # remaining chunks in their original (logical) order.
+    ordered = [t for t in chunks if t.numel()]
     if not ordered:
         return None
     # The first chunk may start at any element offset of the shared buffer

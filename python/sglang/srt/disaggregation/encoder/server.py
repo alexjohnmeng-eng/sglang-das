@@ -1,4 +1,5 @@
 import asyncio
+from collections import OrderedDict
 import concurrent.futures
 import ctypes
 import hashlib
@@ -729,6 +730,11 @@ class MMEncoder:
                     )
 
             self.req_states: Dict[str, ReqState] = {}
+            # Completed (req_id, destination) /send deliveries outlive ReqState
+            # long enough for a retry whose HTTP response was lost: the data is
+            # already on the receiver, so answering success is correct and
+            # failing it would turn a lost response into a failed request.
+            self._completed_sends: "OrderedDict[str, float]" = OrderedDict()
             # A DP caller can disappear before its encode creates ReqState.
             # Preserve that release intent until _acquire_encode_ref runs.
             self.abandoned_req_ids: Set[str] = set()
@@ -853,6 +859,34 @@ class MMEncoder:
             raise InternalError(f"No embedding available for request: {state.req_id}")
         return state.embedding_data
 
+    _SEND_TOMBSTONE_MAX = 8192
+    _SEND_TOMBSTONE_TTL_S = 900.0
+
+    def _tombstone_key(self, req_id: str, key: str) -> str:
+        return f"{req_id}|{key}"
+
+    def _remember_completed_send(self, req_id: str, key: str) -> None:
+        now = time.monotonic()
+        tomb = getattr(self, "_completed_sends", None)
+        if tomb is None:  # unit tests build the encoder with __new__
+            self._completed_sends = tomb = OrderedDict()
+        tomb[self._tombstone_key(req_id, key)] = now
+        while tomb:
+            oldest_key, oldest_at = next(iter(tomb.items()))
+            if (
+                len(tomb) <= self._SEND_TOMBSTONE_MAX
+                and now - oldest_at <= self._SEND_TOMBSTONE_TTL_S
+            ):
+                break
+            tomb.pop(oldest_key, None)
+
+    def _send_already_completed(self, req_id: str, key: str) -> bool:
+        tomb = getattr(self, "_completed_sends", None)
+        if tomb is None:
+            return False
+        at = tomb.get(self._tombstone_key(req_id, key))
+        return at is not None and time.monotonic() - at <= self._SEND_TOMBSTONE_TTL_S
+
     async def send_to_destination(
         self, state: ReqState, destination: SendDestination
     ) -> None:
@@ -870,6 +904,17 @@ class MMEncoder:
                 self.req_states.get(state.req_id) is not state
                 or state.release_requested
             ):
+                # The final /send may have completed while its HTTP response
+                # was lost; release_request then removed the state. A retry of
+                # that exact destination is still a success.
+                if self._send_already_completed(state.req_id, key):
+                    logger.info(
+                        "Retried /send for req_id=%s -> %s after release; "
+                        "already delivered, returning success",
+                        state.req_id,
+                        key,
+                    )
+                    return
                 raise InternalError(f"Encoder request was released: {state.req_id}")
             state.active_sends += 1
             lock = state.send_locks.get(key)
@@ -888,6 +933,7 @@ class MMEncoder:
                     return
                 await self.delivery.send(state, destination)
                 state.sent_destinations.add(key)
+                self._remember_completed_send(state.req_id, key)
         finally:
             async with state.lifecycle_condition:
                 state.active_sends -= 1

@@ -21,11 +21,26 @@ def test_adjacent_slices_share_storage():
     assert torch.equal(out, base)
 
 
-def test_out_of_order_slices_still_merge():
+def test_out_of_order_slices_fall_back_to_concat():
+    """Physical order must not override the caller's logical order.
+
+    The chunks feed placeholder tokens in the order given; a view over the
+    sorted storage would attach rows 0..3 to tokens that expect 2,3,0,1.
+    """
     base = torch.arange(16.0).reshape(4, 4)
-    out = _concat_or_view([base[2:4], base[0:2]])
-    # Sorted by storage offset: rows 0..3 again.
-    assert torch.equal(out, base)
+    chunks = [base[2:4], base[0:2]]
+    out = _concat_or_view(chunks)
+    assert torch.equal(out, torch.cat(chunks))
+    assert out.untyped_storage().data_ptr() != base.untyped_storage().data_ptr()
+
+
+def test_non_contiguous_chunks_fall_back():
+    """Same storage and stride is not enough: rows must be contiguous."""
+    base = torch.arange(32.0)
+    rows = base.as_strided((8, 2), (2, 1))
+    gaps = rows.as_strided((4, 2), (4, 1))  # every other row
+    out = _concat_or_view([gaps[0:2], gaps[2:4]])
+    assert torch.equal(out, torch.cat([gaps[0:2], gaps[2:4]]))
 
 
 def test_gap_falls_back_to_concat():

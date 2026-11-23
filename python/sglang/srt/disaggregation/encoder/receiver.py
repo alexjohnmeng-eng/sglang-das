@@ -876,6 +876,21 @@ class DuplicateEmbeddingPartError(ValueError):
     """
 
 
+def _send_may_have_written(resp) -> bool:
+    """True when a failed ``/send`` cannot prove the RDMA write never started.
+
+    A timeout or a dropped connection obviously proves nothing. Neither does
+    a 5xx: the DP dispatcher turns a worker timeout into an HTTP 504 error
+    envelope after the request was dispatched, so the worker may already be
+    writing into the slot. Only an explicit 4xx (validation refused the
+    request) is a safe failure.
+    """
+    if isinstance(resp, (asyncio.TimeoutError, aiohttp.ClientError)):
+        return True
+    status = getattr(resp, "status", None)
+    return isinstance(status, int) and status >= 500
+
+
 def _aggregate_embedding_part(current, recv_obj, model_type):
     """Fold one received part into the aggregate (the first part creates it)."""
     if current is None:
@@ -1796,6 +1811,22 @@ class SharedWaitingRDMARequest(WaitingRDMARequest):
         # Set when this rank's /send died without proving the encoder stopped
         # writing; the ack then retires the slot range instead of recycling it.
         self._drain_unknown = False
+        # True once the slot was handed to the mm_inputs lease. From then on
+        # the *consumer* owns the release: `_pool_slot_id` is None by design,
+        # so "no buffer" must not be read as "this rank can never read the
+        # arena again".
+        self._lease_bound = False
+
+    def _bind_pool_slot_to_mm_inputs(self, mm_inputs) -> bool:
+        # Same lock as _should_ack_on_thread_exit: otherwise the receive
+        # thread could observe the detached buffer (super() nulls it) before
+        # the flag below is set, and acknowledge a slot that the consumer now
+        # owns.
+        with self._buffer_lock:
+            bound = super()._bind_pool_slot_to_mm_inputs(mm_inputs)
+            if bound:
+                self._lease_bound = True
+        return bound
 
     def _ack_once(self) -> None:
         """Tell the owner this rank is done with the request (idempotent)."""
@@ -1809,6 +1840,19 @@ class SharedWaitingRDMARequest(WaitingRDMARequest):
                 "Shared arena: failed to acknowledge rid=%s", self.rid
             )
 
+    def _cleanup_gpu_buffer(self):
+        """Ack a still-owned slot through ``_ack_once``.
+
+        The base implementation calls ``embedding_pool.release(slot)`` with
+        default arguments, which drops ``_drain_unknown``: a failure could then
+        enqueue a plain ACK first and the unsafe ACK afterwards, and the owner
+        frees the range on the first one.
+        """
+        if self._pool_slot_id is not None:
+            self._ack_once()
+            self._pool_slot_id = None
+        self.embeddings_buffer = None
+
     def release_resources(self):
         """A failed request still has to acknowledge, even if it never got a
         slot: the owner only frees once every rank of the group answered.
@@ -1816,12 +1860,15 @@ class SharedWaitingRDMARequest(WaitingRDMARequest):
         A rank that already owns a slot must not ack here: its receive thread
         may still have an RDMA write (owner) or a chunk copy (peer) in flight,
         and the base class defers that release to the thread's exit or to
-        ``_cleanup_gpu_buffer``, which knows when the buffer is idle.
+        ``_cleanup_gpu_buffer``, which knows when the buffer is idle. A rank
+        whose slot was bound to the mm_inputs lease also must not ack here:
+        ``super().release_resources()`` ran the lease finalizer, which is the
+        single safe release for that slot.
         """
         super().release_resources()
         with self._buffer_lock:
             owns_buffer = self._pool_slot_id is not None or self._receive_running
-        if not owns_buffer:
+        if not owns_buffer and not self._lease_bound:
             self._ack_once()
 
     def _run_receive_in_thread(self):
@@ -1836,13 +1883,25 @@ class SharedWaitingRDMARequest(WaitingRDMARequest):
             # PENDING here, and the scheduler saw _receive_running=True, so it
             # did not ack either), and the owner then held the slot until TTL
             # and abandoned it.
-            with self._buffer_lock:
-                owns_buffer = (
-                    self._pool_slot_id is not None
-                    or self.embeddings_buffer is not None
-                )
-            if not owns_buffer:
+            if self._should_ack_on_thread_exit():
                 self._ack_once()
+
+    def _should_ack_on_thread_exit(self) -> bool:
+        """Whether the receive thread may acknowledge on its way out.
+
+        The thread owns the buffer while it runs; once it is gone and this
+        rank holds no buffer, it can never read the arena for this rid again.
+        A bound lease is different: the scheduler may assemble (and detach the
+        buffer) between this thread clearing ``_receive_running`` and this
+        check. The consumer still reads the arena through the lease, so only
+        the lease may release the slot.
+        """
+        with self._buffer_lock:
+            owns_buffer = (
+                self._pool_slot_id is not None
+                or self.embeddings_buffer is not None
+            )
+        return not owns_buffer and not self._lease_bound
 
     async def _receive_into_buffer(
         self, session, encode_requests, embedding_sizes, response_sorted, total_bytes
@@ -1918,13 +1977,14 @@ class SharedWaitingRDMARequest(WaitingRDMARequest):
 
         send_responses = await asyncio.gather(*send_tasks, return_exceptions=True)
         if self._is_owner and any(
-            isinstance(resp, (asyncio.TimeoutError, aiohttp.ClientError))
-            for resp in send_responses
+            _send_may_have_written(resp) for resp in send_responses
         ):
             # The encoder keeps a zero-copy transfer alive after its HTTP
             # caller goes away, so a write may still be in flight into this
-            # slot. An explicit HTTP error answer proves it never started; a
-            # timeout or a dropped connection proves nothing.
+            # slot. A timeout, a dropped connection, or a 5xx (the DP
+            # dispatcher reports a worker timeout as an HTTP 504 envelope)
+            # proves nothing; only an explicit 4xx proves the transfer never
+            # started.
             self._drain_unknown = True
         if not await self._check_encoder_responses(send_responses, "/send"):
             self.arena.mark_failed(self.rid, "encoder /send failed")
