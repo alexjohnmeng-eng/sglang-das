@@ -139,3 +139,84 @@ def test_health_routes_point_at_the_handler():
     assert routes["/health"] is hs.health_generate
     assert routes["/health_generate"] is hs.health_generate
     assert hs._drop_health_requests not in set(routes.values())
+
+
+def test_single_rank_success_path_aborts_before_dropping_state(monkeypatch):
+    """The single-DP success path must let the probe clean up before pop.
+
+    ``generate_request`` only aborts a request while its ``rid_to_state`` entry
+    is still registered. The old single-rank path cancelled the task, popped
+    the state and only then awaited the task, so a probe that had already been
+    admitted stayed in the scheduler (and, in PD mode, in the decode prealloc
+    queue). This test models that cleanup contract explicitly.
+    """
+    import time
+    from types import SimpleNamespace
+
+    from sglang.srt.entrypoints import http_server as hs
+
+    class _TM:
+        gracefully_exit = False
+        server_warmup_result = True
+        server_status = None
+        elastic_worker_count = 1
+        is_generation = True
+
+        def __init__(self):
+            self.last_receive_tstamp = 0.0
+            self.rid_to_state = {}
+            self.aborted = []
+
+        def abort_request(self, rid):
+            self.aborted.append(rid)
+            self.rid_to_state.pop(rid, None)
+
+        async def generate_request(self, gri, request):
+            # tokenizer_manager.generate_request is consumed with ``async for``.
+            rid = gri.rid
+            self.rid_to_state[rid] = object()  # admitted
+            try:
+                while True:
+                    await asyncio.sleep(0.02)
+                    self.last_receive_tstamp = time.time()
+                    yield None
+            except asyncio.CancelledError:
+                # Mirrors tokenizer_manager: the cleanup can only abort while
+                # the state is still there.
+                if rid in self.rid_to_state:
+                    self.abort_request(rid)
+                raise
+
+    tm = _TM()
+    monkeypatch.setattr(
+        hs,
+        "_global_state",
+        SimpleNamespace(
+            tokenizer_manager=tm, template_manager=None, scheduler_info={}
+        ),
+    )
+    monkeypatch.setattr(hs, "HEALTH_CHECK_TIMEOUT", 5)
+    monkeypatch.setattr(hs, "get_parallel", lambda: SimpleNamespace(attn_dp_enabled=False))
+    monkeypatch.setattr(
+        hs,
+        "get_disagg",
+        lambda: SimpleNamespace(disaggregation_mode=hs.DisaggregationMode.NULL.value),
+    )
+    monkeypatch.setattr(hs.envs.SGLANG_DIAG_BYPASS_HEALTH_GENERATE, "get", lambda: False)
+    monkeypatch.setattr(
+        hs.envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION, "get", lambda: True
+    )
+
+    request = SimpleNamespace(url=SimpleNamespace(path="/health"))
+
+    async def scenario():
+        resp = await hs.health_generate(request)
+        return resp
+
+    resp = asyncio.run(scenario())
+    assert resp.status_code == 200
+    # Abort happened (state existed when the cancelled task cleaned up) and no
+    # probe state was left behind.
+    assert len(tm.aborted) == 1
+    assert tm.aborted[0].startswith("HEALTH_CHECK")
+    assert tm.rid_to_state == {}

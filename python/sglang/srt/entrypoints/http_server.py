@@ -749,8 +749,13 @@ async def _drop_health_requests(
         gather.cancel()
         try:
             await gather
-        except BaseException:
+        except asyncio.CancelledError:
+            # Expected: this cleanup cancelled the fan-out itself.
             pass
+        except Exception:
+            # A probe that failed on its own must not turn /health into a 500,
+            # but it should still show up in the log.
+            logger.exception("Health probe failed during cleanup")
     elif tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
     for gri in health_requests:
@@ -919,14 +924,15 @@ async def health_generate(request: Request) -> Response:
     while time.time() < tic + HEALTH_CHECK_TIMEOUT:
         await asyncio.sleep(1)
         if tokenizer_manager.last_receive_tstamp > tic:
-            tasks[0].cancel()
-            tokenizer_manager.rid_to_state.pop(health_requests[0].rid, None)
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # Cancel first, let generate_request's own cleanup run, and only
+            # then abort/drop whatever it could not clean up. Dropping the
+            # state before the cancelled task observed it made that cleanup
+            # skip abort_request, leaving the probe admitted in the scheduler.
+            await _drop_health_requests(tokenizer_manager, tasks, health_requests)
             tokenizer_manager.server_status = ServerStatus.Up
             return Response(status_code=200)
 
-    tasks[0].cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
+    await _drop_health_requests(tokenizer_manager, tasks, health_requests)
     tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
     last_receive_time = time.strftime(
         "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
@@ -936,7 +942,6 @@ async def health_generate(request: Request) -> Response:
         f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
         f"last_heartbeat time: {last_receive_time}"
     )
-    tokenizer_manager.rid_to_state.pop(health_requests[0].rid, None)
     tokenizer_manager.server_status = ServerStatus.UnHealthy
     return Response(status_code=503)
 
