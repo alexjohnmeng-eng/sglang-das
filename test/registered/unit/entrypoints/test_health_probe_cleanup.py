@@ -16,8 +16,18 @@ Run: pytest -q test/srt/test_health_probe_cleanup.py
 
 import asyncio
 import gc
+import sys
 
 import pytest
+
+try:
+    from sglang.test.ci.ci_register import register_cpu_ci
+except ImportError:  # standalone run without an sglang install
+    def register_cpu_ci(**kwargs):
+        pass
+
+
+register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
 from sglang.srt.entrypoints.http_server import _drop_health_requests
 
@@ -68,16 +78,30 @@ def test_drop_consumes_futures_and_aborts(use_gather):
 
 
 def test_drop_tolerates_probe_that_already_cleaned_up():
-    """A probe whose own cleanup removed its state must not be aborted twice."""
+    """A probe whose own cleanup removed its state must not be aborted twice.
+
+    The state is present when the helper starts (as in production) and the
+    cancelled task removes it while cleaning up, before the helper's abort
+    loop runs.
+    """
 
     async def scenario():
-        tm = _FakeTokenizerManager([])
+        tm = _FakeTokenizerManager(["h2"])
         gri = _FakeGri("h2")
-        task = asyncio.create_task(asyncio.sleep(30))
+
+        async def probe():
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                tm.rid_to_state.pop("h2", None)  # the probe cleaned up itself
+                raise
+
+        task = asyncio.create_task(probe())
         await asyncio.sleep(0)
         await _drop_health_requests(tm, [task], [gri], None)
-        assert tm.aborted == []
+        assert tm.aborted == []  # no double abort
         assert tm.rid_to_state == {}
+        assert task.cancelled()
 
     asyncio.run(scenario())
 
@@ -106,6 +130,10 @@ def test_unpatched_pattern_leaks_the_cancelled_gather():
     the gather; the cancelled _GatheringFuture is then collected with its
     exception never retrieved, which the event loop reports exactly as the
     production log did.
+
+    This is a documentation test of the asyncio contract (it intentionally
+    drives no production code); the behaviour it relies on is stable across
+    the supported CPython versions (3.10-3.12).
     """
 
     async def scenario():
@@ -166,6 +194,7 @@ def test_single_rank_success_path_aborts_before_dropping_state(monkeypatch):
             self.last_receive_tstamp = 0.0
             self.rid_to_state = {}
             self.aborted = []
+            self.cancelled_seen = 0
 
         def abort_request(self, rid):
             self.aborted.append(rid)
@@ -174,18 +203,18 @@ def test_single_rank_success_path_aborts_before_dropping_state(monkeypatch):
         async def generate_request(self, gri, request):
             # tokenizer_manager.generate_request is consumed with ``async for``.
             rid = gri.rid
-            self.rid_to_state[rid] = object()  # admitted
+            self.rid_to_state[rid] = object()  # admitted, no output yet
             try:
-                while True:
-                    await asyncio.sleep(0.02)
-                    self.last_receive_tstamp = time.time()
-                    yield None
+                await asyncio.Event().wait()  # stays pending until cancelled
             except asyncio.CancelledError:
                 # Mirrors tokenizer_manager: the cleanup can only abort while
-                # the state is still there.
+                # the state is still registered.
+                self.cancelled_seen += 1
                 if rid in self.rid_to_state:
                     self.abort_request(rid)
                 raise
+            if False:  # pragma: no cover - keeps this an async generator
+                yield None
 
     tm = _TM()
     monkeypatch.setattr(
@@ -210,13 +239,28 @@ def test_single_rank_success_path_aborts_before_dropping_state(monkeypatch):
     request = SimpleNamespace(url=SimpleNamespace(path="/health"))
 
     async def scenario():
-        resp = await hs.health_generate(request)
-        return resp
+        # User traffic proves the scheduler is stepping; the probe itself never
+        # produces output and has to be cancelled by the handler.
+        async def heartbeat():
+            while True:
+                await asyncio.sleep(0.02)
+                tm.last_receive_tstamp = time.time()
+
+        hb = asyncio.create_task(heartbeat())
+        try:
+            return await hs.health_generate(request)
+        finally:
+            hb.cancel()
+            await asyncio.gather(hb, return_exceptions=True)
 
     resp = asyncio.run(scenario())
     assert resp.status_code == 200
-    # Abort happened (state existed when the cancelled task cleaned up) and no
-    # probe state was left behind.
+    # The probe was genuinely cancelled and aborted while its state existed.
+    assert tm.cancelled_seen == 1
     assert len(tm.aborted) == 1
     assert tm.aborted[0].startswith("HEALTH_CHECK")
     assert tm.rid_to_state == {}
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

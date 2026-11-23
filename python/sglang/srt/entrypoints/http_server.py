@@ -745,32 +745,45 @@ async def _drop_health_requests(
     """
     for task in tasks:
         task.cancel()
-    if gather is not None:
-        gather.cancel()
-        try:
-            await gather
-        except asyncio.CancelledError:
-            # Expected: this cleanup cancelled the fan-out itself.
-            pass
-        except Exception:
-            # A probe that failed on its own must not turn /health into a 500,
-            # but it should still show up in the log.
-            logger.exception("Health probe failed during cleanup")
-    elif tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    for gri in health_requests:
-        rids = gri.rid if isinstance(gri.rid, list) else [gri.rid]
-        for rid in rids:
-            if rid not in tokenizer_manager.rid_to_state:
-                continue
-            # A probe that never made it through the cleanup still has its
-            # request admitted (and, in PD mode, preallocated on the decode
-            # side): abort it before dropping the state.
+    try:
+        if gather is not None:
+            gather.cancel()
             try:
-                tokenizer_manager.abort_request(rid)
+                await gather
+            except asyncio.CancelledError:
+                # Expected: this cleanup cancelled the fan-out itself.
+                pass
             except Exception:
-                logger.exception("Health check abort failed for %s", rid)
-            tokenizer_manager.rid_to_state.pop(rid, None)
+                # A probe that failed on its own must not turn /health into a
+                # 500, but it should still show up in the log.
+                logger.exception("Health probe failed during cleanup")
+        if tasks:
+            # ``gather.cancel()`` is a no-op once the fan-out is done (one probe
+            # failed early, shutdown...); the siblings may still be pending and
+            # their own cleanup needs the state below, so wait for them too.
+            # Re-awaiting finished tasks is free.
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException) and not isinstance(
+                    result, asyncio.CancelledError
+                ):
+                    logger.error("Health probe failed during cleanup: %r", result)
+    finally:
+        # Run even if this handler is itself cancelled while waiting: an
+        # admitted probe must never be left in the scheduler.
+        for gri in health_requests:
+            rids = gri.rid if isinstance(gri.rid, list) else [gri.rid]
+            for rid in rids:
+                if rid not in tokenizer_manager.rid_to_state:
+                    continue
+                # A probe that never made it through the cleanup still has its
+                # request admitted (and, in PD mode, preallocated on the decode
+                # side): abort it before dropping the state.
+                try:
+                    tokenizer_manager.abort_request(rid)
+                except Exception:
+                    logger.exception("Health check abort failed for %s", rid)
+                tokenizer_manager.rid_to_state.pop(rid, None)
 
 
 @app.get("/health")
@@ -892,6 +905,11 @@ async def health_generate(request: Request) -> Response:
             if done:
                 try:
                     fan_out.result()
+                except asyncio.CancelledError:
+                    # A probe was cancelled underneath us (shutdown or loop
+                    # teardown). Fall through to the drop path instead of
+                    # escaping with the probes still admitted.
+                    break
                 except Exception:
                     break
                 tokenizer_manager.server_status = ServerStatus.Up
