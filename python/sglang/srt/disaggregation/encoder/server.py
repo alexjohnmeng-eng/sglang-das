@@ -1,4 +1,5 @@
 import asyncio
+from collections import OrderedDict
 import concurrent.futures
 import ctypes
 import hashlib
@@ -367,6 +368,14 @@ class ReqState:
     lifecycle_condition: asyncio.Condition = field(
         default_factory=asyncio.Condition, repr=False
     )
+    # Destinations this request already delivered to. A decoder retries /send
+    # when the HTTP response is lost; running the transfer again would emit a
+    # second completion ack for the same part, which the receiver rejects as a
+    # duplicate and fails the whole request.
+    sent_destinations: Set[str] = field(default_factory=set, repr=False)
+    # One lock per destination, so a retry that races the still-running first
+    # attempt waits for it instead of transferring twice.
+    send_locks: Dict[str, asyncio.Lock] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True)
@@ -376,6 +385,9 @@ class SendDestination:
     endpoint: str
     session_id: Optional[str] = None
     buffer_address: Optional[int] = None
+    # A sibling rank of a shared embedding arena only wants the completion ack:
+    # the owner already moved the bytes into the shared segment.
+    meta_only: bool = False
 
     @classmethod
     def from_host_port(
@@ -385,16 +397,29 @@ class SendDestination:
         *,
         session_id: Optional[str] = None,
         buffer_address: Optional[int] = None,
+        meta_only: bool = False,
     ) -> "SendDestination":
         return cls(
             endpoint=NetworkAddress(prefill_host, embedding_port).to_host_port_str(),
             session_id=session_id,
             buffer_address=buffer_address,
+            meta_only=meta_only,
         )
 
     @classmethod
     def from_url(cls, url: str) -> "SendDestination":
         return cls(endpoint=NetworkAddress.parse(url).to_host_port_str())
+
+    def idempotency_key(self) -> str:
+        """Identify one transfer target within one request.
+
+        Multi-part requests send each part to a distinct ``buffer_address``, so
+        the address is what tells two parts addressed to the same rank apart.
+        """
+        return (
+            f"{self.endpoint}|session={self.session_id}"
+            f"|addr={self.buffer_address}|meta_only={int(self.meta_only)}"
+        )
 
 
 class TensorWrapper:
@@ -450,6 +475,7 @@ class MooncakeDelivery(EncoderDelivery):
             session_id=destination.session_id,
             buffer_address=destination.buffer_address,
             url=destination.endpoint,
+            skip_transfer=destination.meta_only,
         )
 
     async def release(self, state: ReqState) -> None:
@@ -704,6 +730,11 @@ class MMEncoder:
                     )
 
             self.req_states: Dict[str, ReqState] = {}
+            # Completed (req_id, destination) /send deliveries outlive ReqState
+            # long enough for a retry whose HTTP response was lost: the data is
+            # already on the receiver, so answering success is correct and
+            # failing it would turn a lost response into a failed request.
+            self._completed_sends: "OrderedDict[str, float]" = OrderedDict()
             # A DP caller can disappear before its encode creates ReqState.
             # Preserve that release intent until _acquire_encode_ref runs.
             self.abandoned_req_ids: Set[str] = set()
@@ -828,18 +859,81 @@ class MMEncoder:
             raise InternalError(f"No embedding available for request: {state.req_id}")
         return state.embedding_data
 
+    _SEND_TOMBSTONE_MAX = 8192
+    _SEND_TOMBSTONE_TTL_S = 900.0
+
+    def _tombstone_key(self, req_id: str, key: str) -> str:
+        return f"{req_id}|{key}"
+
+    def _remember_completed_send(self, req_id: str, key: str) -> None:
+        now = time.monotonic()
+        tomb = getattr(self, "_completed_sends", None)
+        if tomb is None:  # unit tests build the encoder with __new__
+            self._completed_sends = tomb = OrderedDict()
+        tomb[self._tombstone_key(req_id, key)] = now
+        while tomb:
+            oldest_key, oldest_at = next(iter(tomb.items()))
+            if (
+                len(tomb) <= self._SEND_TOMBSTONE_MAX
+                and now - oldest_at <= self._SEND_TOMBSTONE_TTL_S
+            ):
+                break
+            tomb.pop(oldest_key, None)
+
+    def _send_already_completed(self, req_id: str, key: str) -> bool:
+        tomb = getattr(self, "_completed_sends", None)
+        if tomb is None:
+            return False
+        at = tomb.get(self._tombstone_key(req_id, key))
+        return at is not None and time.monotonic() - at <= self._SEND_TOMBSTONE_TTL_S
+
     async def send_to_destination(
         self, state: ReqState, destination: SendDestination
     ) -> None:
+        """Deliver one part to one destination, at most once per request.
+
+        ``/send`` is retried by the receiver when the HTTP response is lost.
+        The transfer itself is not idempotent as seen by the peer: every call
+        emits a completion ack, and a second ack for an already-received part
+        makes the receiver reject the whole request as a duplicate. Serialize
+        per destination and skip a target this request already served.
+        """
+        key = destination.idempotency_key()
         async with state.lifecycle_condition:
             if (
                 self.req_states.get(state.req_id) is not state
                 or state.release_requested
             ):
+                # The final /send may have completed while its HTTP response
+                # was lost; release_request then removed the state. A retry of
+                # that exact destination is still a success.
+                if self._send_already_completed(state.req_id, key):
+                    logger.info(
+                        "Retried /send for req_id=%s -> %s after release; "
+                        "already delivered, returning success",
+                        state.req_id,
+                        key,
+                    )
+                    return
                 raise InternalError(f"Encoder request was released: {state.req_id}")
             state.active_sends += 1
+            lock = state.send_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                state.send_locks[key] = lock
         try:
-            await self.delivery.send(state, destination)
+            async with lock:
+                if key in state.sent_destinations:
+                    logger.info(
+                        "Duplicate /send for req_id=%s -> %s already delivered; "
+                        "returning success without re-sending",
+                        state.req_id,
+                        key,
+                    )
+                    return
+                await self.delivery.send(state, destination)
+                state.sent_destinations.add(key)
+                self._remember_completed_send(state.req_id, key)
         finally:
             async with state.lifecycle_condition:
                 state.active_sends -= 1
@@ -1968,6 +2062,7 @@ class MMEncoder:
         prefill_host=None,
         embedding_port=None,
         url=None,
+        skip_transfer: bool = False,
     ):
         if (
             envs.SGLANG_ENCODER_CHECK_NAN.get()
@@ -1980,7 +2075,18 @@ class MMEncoder:
                 mm_data.req_id,
                 tuple(embedding.shape),
             )
-        if get_disagg().encoder_transfer_backend == "mooncake":
+        if (
+            get_disagg().encoder_transfer_backend == "mooncake"
+            and skip_transfer
+        ):
+            # A sibling rank of a shared embedding arena: the owner already
+            # pushed the bytes into the shared segment, so only the completion
+            # ack (which carries shapes, offsets and hashes) is still needed.
+            logger.info(
+                "Mooncake meta-only send for req_id=%s (shared arena peer)",
+                mm_data.req_id,
+            )
+        elif get_disagg().encoder_transfer_backend == "mooncake":
             # Encode is synchronous, so mm_data was staged before /encode returned.
             req_id = mm_data.req_id
             if embedding is None:
@@ -2397,7 +2503,13 @@ class MMEncoder:
 
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
     async def send(
-        self, req_id, prefill_host, embedding_port, session_id=None, buffer_address=None
+        self,
+        req_id,
+        prefill_host,
+        embedding_port,
+        session_id=None,
+        buffer_address=None,
+        meta_only: bool = False,
     ):
         state = self.req_states.get(req_id)
         if state is None:
@@ -2415,6 +2527,7 @@ class MMEncoder:
                 embedding_port,
                 session_id=session_id,
                 buffer_address=buffer_address,
+                meta_only=meta_only,
             ),
         )
         return True
