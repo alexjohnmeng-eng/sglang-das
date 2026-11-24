@@ -691,3 +691,59 @@ def test_tombstoned_retry_does_not_recreate_the_send_counter(monkeypatch):
     assert ok is True
     assert calls == []
     assert server.meta_registry._rid_to_send_done == {}
+
+
+def test_split_fast_path_forwards_whole_batch_row_index(monkeypatch):
+    """All-precomputed batches must still hand the CP predicate a row index.
+
+    ``_embed_mm_inputs_with_split`` returns ``embed_mm_inputs`` directly when
+    every request is precomputed (the normal EPD shape). Without a row index
+    the shared-host scatter disables row filtering and every rank stages the
+    whole chunk, which loses the CP H2D saving entirely.
+    """
+    from sglang.srt.layers.cp import utils as cp_utils
+    from sglang.srt.managers import mm_utils
+
+    calls = {}
+
+    def fake_embed(**kwargs):
+        calls.update(kwargs)
+        return None, {}
+
+    def fake_keep(_batch):
+        return lambda rows: rows < 2
+
+    monkeypatch.setattr(mm_utils, "embed_mm_inputs", fake_embed)
+    monkeypatch.setattr(cp_utils, "cp_row_keep_fn", fake_keep)
+
+    class _Item:
+        precomputed_embeddings = torch.zeros(1, 2)
+
+    class _MM:
+        mm_items = [_Item()]
+
+    def run():
+        return mm_utils._embed_mm_inputs_with_split(
+            mm_inputs_list=[_MM()],
+            extend_prefix_lens=[0],
+            extend_seq_lens=[8],
+            input_ids=torch.zeros(8, dtype=torch.long),
+            forward_batch=object(),
+            input_embedding=None,
+            multimodal_model=None,
+            data_embedding_func_mapping=None,
+            placeholder_tokens=None,
+            use_deepstack={},
+        )
+
+    run()
+    assert calls["keep_fn"] is not None
+    assert calls["row_index"] is not None
+    assert calls["row_index"].tolist() == list(range(8))
+
+    # Without a CP predicate nothing is built (the scatter ignores it).
+    calls.clear()
+    monkeypatch.setattr(cp_utils, "cp_row_keep_fn", lambda _batch: None)
+    run()
+    assert calls["keep_fn"] is None
+    assert calls["row_index"] is None

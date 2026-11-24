@@ -868,11 +868,20 @@ def _embed_mm_inputs_with_split(
     )
 
     if not precomputed_req_indices or not non_precomputed_req_indices:
+        # This call sees the whole batch, so an identity row index is the
+        # global row number the CP predicate expects. Without it the shared
+        # host staging would disable row filtering and every rank would H2D
+        # the entire chunk.
         return embed_mm_inputs(
             mm_inputs_list=mm_inputs_list,
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
             input_ids=input_ids,
+            row_index=(
+                torch.arange(input_ids.shape[0], device=input_ids.device)
+                if keep_fn is not None
+                else None
+            ),
             **embed_kwargs,
         )
 
