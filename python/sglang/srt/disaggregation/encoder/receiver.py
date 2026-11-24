@@ -1856,13 +1856,19 @@ class SharedWaitingRDMARequest(WaitingRDMARequest):
                 "Shared arena: failed to acknowledge rid=%s", self.rid
             )
 
-    def _cleanup_gpu_buffer(self):
-        """Ack a still-owned slot through ``_ack_once``.
+    def _release_buffer_locked(self):
+        """Release the arena slot in the hook the base class runs *after* the
+        receive thread has exited.
 
-        The base implementation calls ``embedding_pool.release(slot)`` with
-        default arguments, which drops ``_drain_unknown``: a failure could then
-        enqueue a plain ACK first and the unsafe ACK afterwards, and the owner
-        frees the range on the first one.
+        The base ``_cleanup_gpu_buffer`` latches ``_terminal`` and defers this
+        call while a transfer may still be running; acking there instead would
+        report a safe release before the owner's ``/send`` had a chance to
+        fail with a timeout/5xx, and the later ``_drain_unknown`` could never
+        be retracted (``_ack_once`` is once-only).
+
+        The base hook also calls ``embedding_pool.release(slot)`` with default
+        arguments, which would drop ``_drain_unknown``; the arena slot is
+        always acknowledged through ``_ack_once`` here.
         """
         if self._pool_slot_id is not None:
             self._ack_once()

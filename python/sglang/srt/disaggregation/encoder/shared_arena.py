@@ -256,12 +256,23 @@ class SharedEmbeddingArena:
                 self._ready_out.append(rid)
             self._signal_waiters_locked(rid)
 
+    def _mark_failed_locked(self, rid: str, reason: str) -> None:
+        """Record FAILED once, in the state *and* in the tick delta.
+
+        Every failure entry point (receiver ``mark_failed``, allocation
+        timeout) must go through here: writing ``_failed`` directly used to
+        leave ``_failed_out`` empty, so peers never learned that the owner
+        had already refused the slot.
+        """
+        if rid in self._failed:
+            return
+        self._failed[rid] = reason or "shared arena failure"
+        self._failed_out[rid] = self._failed[rid]
+        self._signal_waiters_locked(rid)
+
     def mark_failed(self, rid: str, reason: str = "") -> None:
         with self._lock:
-            if rid not in self._failed:
-                self._failed[rid] = reason or "shared arena failure"
-                self._failed_out[rid] = self._failed[rid]
-            self._signal_waiters_locked(rid)
+            self._mark_failed_locked(rid, reason or "shared arena failure")
 
     def is_data_ready(self, rid: str) -> bool:
         with self._lock:
@@ -497,11 +508,19 @@ class SharedEmbeddingArena:
                         self._reuse_unsafe.discard(rid)
                     if len(self._reuse_unsafe) <= _STATE_KEEP:
                         break
-            # One Event per rid replaces the old 2ms poll; drop the ones whose
-            # request is gone and nobody is waiting for any more.
+            # One Event per rid replaces the old 2ms poll. ``_requests`` only
+            # tracks slot-assignment waiters, so "not in _requests" does not
+            # mean nobody waits for DATA_READY. Only drop events whose rid is
+            # already terminal: those were signalled (Event.set persists, a
+            # blocked thread still wakes) and future waiters return from the
+            # state check without the event.
             if len(self._wait_events) > _STATE_KEEP:
                 for rid in list(self._wait_events):
-                    if rid not in self._requests:
+                    if (
+                        rid in self._data_ready
+                        or rid in self._failed
+                        or rid in self._dead
+                    ):
                         self._wait_events.pop(rid, None)
                     if len(self._wait_events) <= _STATE_KEEP:
                         break
@@ -589,14 +608,15 @@ class SharedEmbeddingArena:
         timeout = envs.SGLANG_EMBEDDING_POOL_ALLOC_TIMEOUT_S.get()
         if now - started > timeout:
             self._pending_since.pop(rid, None)
-            self._failed[rid] = (
+            reason = (
                 f"shared embedding arena full for {timeout:.0f}s "
                 f"(inflight={len(self._slots)}, cap={self.size_bytes // (1024 * 1024)}MB)"
             )
+            self._mark_failed_locked(rid, reason)
             self._alloc_timeouts += 1
             req = self._requests.get(rid)
             if req is not None:
-                req.fail(self._failed[rid])
+                req.fail(reason)
 
     def _resolve_local_request(self, rid: str, nbytes: int) -> None:
         with self._lock:

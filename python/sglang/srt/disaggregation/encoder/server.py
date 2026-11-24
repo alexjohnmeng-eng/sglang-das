@@ -2511,8 +2511,27 @@ class MMEncoder:
         buffer_address=None,
         meta_only: bool = False,
     ):
+        destination = SendDestination.from_host_port(
+            prefill_host,
+            embedding_port,
+            session_id=session_id,
+            buffer_address=buffer_address,
+            meta_only=meta_only,
+        )
         state = self.req_states.get(req_id)
         if state is None:
+            # The last /send of a request may have completed while its HTTP
+            # response was lost; release_request then removed the state and a
+            # retry lands here. The data is already on the receiver, so the
+            # exact (req_id, destination) pair must still answer success.
+            if self._send_already_completed(req_id, destination.idempotency_key()):
+                logger.info(
+                    "MMEncoder.send: retried /send for released req_id=%s -> %s; "
+                    "already delivered",
+                    req_id,
+                    destination.idempotency_key(),
+                )
+                return True
             # False = nothing transferred: callers must not count this send
             # nor report success, or the decoder waits on an ack never coming.
             logger.warning(
@@ -2520,16 +2539,7 @@ class MMEncoder:
                 f"(already released or unknown)"
             )
             return False
-        await self.send_to_destination(
-            state,
-            SendDestination.from_host_port(
-                prefill_host,
-                embedding_port,
-                session_id=session_id,
-                buffer_address=buffer_address,
-                meta_only=meta_only,
-            ),
-        )
+        await self.send_to_destination(state, destination)
         return True
 
     # For zmq_to_scheduler

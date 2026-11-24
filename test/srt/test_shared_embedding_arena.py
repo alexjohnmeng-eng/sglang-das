@@ -509,3 +509,82 @@ def test_peer_adopts_owner_assignment_and_resolves_waiter():
     arena._adopt("rid-peer", (8192, 4096))
     thread.join(timeout=2)
     assert got["slot"] == (8192, 4096)
+
+
+def test_release_waits_for_receive_thread_before_acking():
+    """A failed request must not ack while /send may still be in flight.
+
+    The base cleanup latches _terminal and defers the release to the thread's
+    exit hook; the arena ack therefore sees the final drain_unknown value.
+    """
+    req = _bare_shared_request(_receive_running=True)
+    req._cleanup_gpu_buffer()
+    assert req._terminal is True
+    assert req.arena.releases == []  # still blocked on the receive thread
+
+    # The thread finishes: its /send timed out, so the write is unproven.
+    with req._buffer_lock:
+        req._receive_running = False
+        req._drain_unknown = True
+        req._release_buffer_locked()
+    assert req.arena.releases == [("rid-1", True)]
+
+
+def test_public_send_answers_released_retry_from_tombstone():
+    from sglang.srt.disaggregation.encoder.server import MMEncoder, SendDestination
+
+    enc = object.__new__(MMEncoder)
+    enc.req_states = {}
+    enc._completed_sends = OrderedDict()
+    dest = SendDestination.from_host_port(
+        "10.0.0.1", 30005, session_id="s1", buffer_address=4096, meta_only=False
+    )
+    args = dict(
+        req_id="req-send",
+        prefill_host="10.0.0.1",
+        embedding_port=30005,
+        session_id="s1",
+        buffer_address=4096,
+        meta_only=False,
+    )
+    assert asyncio.run(enc.send(**args)) is False  # unknown request
+    enc._remember_completed_send("req-send", dest.idempotency_key())
+    assert asyncio.run(enc.send(**args)) is True  # exact retry after release
+    args2 = dict(args, buffer_address=8192)
+    assert asyncio.run(enc.send(**args2)) is False  # different destination
+
+
+def test_allocation_timeout_publishes_failed_delta():
+    import time as _time
+
+    arena = _bare_arena()
+    arena._pending_since = {"rid-to": _time.monotonic() - 3600}
+    arena._alloc_timeouts = 0
+    failed = []
+
+    class _Req:
+        def fail(self, reason):
+            failed.append(reason)
+
+    arena._requests = {"rid-to": _Req()}
+    arena._expire_pending_locked("rid-to", _time.monotonic())
+    assert "rid-to" in arena._failed_out  # peers learn about the refusal
+    assert failed and "full" in failed[0]
+
+
+def test_prune_keeps_events_for_rids_still_waiting():
+    arena = _bare_arena()
+    arena._wait_events = {
+        "rid-ready": threading.Event(),
+        "rid-waiting": threading.Event(),
+    }
+    arena._data_ready = {"rid-ready"}
+    arena._requests = {}  # assignment waiter already resolved
+    old_keep = sa._STATE_KEEP
+    sa._STATE_KEEP = 1
+    try:
+        arena._prune_state()
+    finally:
+        sa._STATE_KEEP = old_keep
+    assert "rid-waiting" in arena._wait_events  # still blocking on DATA_READY
+    assert "rid-ready" not in arena._wait_events  # already signalled
