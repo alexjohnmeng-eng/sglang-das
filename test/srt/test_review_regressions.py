@@ -107,3 +107,47 @@ def test_sorted_view_would_reorder_rows_before_and_after():
     )
     assert not torch.equal(legacy, torch.cat(chunks))  # the bug
     assert torch.equal(_concat_or_view(chunks), torch.cat(chunks))  # fixed
+
+
+def test_tombstoned_retry_does_not_recreate_the_send_counter(monkeypatch):
+    """send_staged_embedding must not count a retry of an already-sent part.
+
+    After the final release note_send_done() would recreate
+    _rid_to_send_done[req_id]; its _pending_at is gone, so the sweeper never
+    removes it again (visible with receive_count > 1).
+    """
+    from sglang.srt.disaggregation.encoder import runtime, server
+
+    calls = []
+
+    class _Registry:
+        def __init__(self):
+            self._rid_to_send_done = {}
+            self._pending_at = {}
+
+        async def note_send_done(self, *args, **kwargs):
+            calls.append(args)
+
+    class _Enc:
+        async def send(self, **kwargs):
+            return server.SEND_ALREADY_COMPLETED
+
+        async def release_request(self, rid):
+            raise AssertionError("a completed retry must not release again")
+
+    monkeypatch.setattr(server, "meta_registry", _Registry())
+    request = {
+        "req_id": "r-retry",
+        "prefill_host": "10.0.0.1",
+        "embedding_port": 30005,
+        "session_id": "s",
+        "buffer_address": 4096,
+        "meta_only": False,
+        "receive_count": 2,
+    }
+    ok = asyncio.run(
+        runtime.send_staged_embedding(_Enc(), request, release_without_count=False)
+    )
+    assert ok is True
+    assert calls == []
+    assert server.meta_registry._rid_to_send_done == {}

@@ -378,6 +378,12 @@ class ReqState:
     send_locks: Dict[str, asyncio.Lock] = field(default_factory=dict, repr=False)
 
 
+# ``MMEncoder.send`` result: the exact (req_id, destination) pair was already
+# delivered before its ReqState was released. Callers must count this as a
+# success but must NOT recreate the send counter (the request is retired).
+SEND_ALREADY_COMPLETED = "already_completed"
+
+
 @dataclass(frozen=True)
 class SendDestination:
     """One normalized destination for exactly one transfer."""
@@ -2531,7 +2537,7 @@ class MMEncoder:
                     req_id,
                     destination.idempotency_key(),
                 )
-                return True
+                return SEND_ALREADY_COMPLETED
             # False = nothing transferred: callers must not count this send
             # nor report success, or the decoder waits on an ack never coming.
             logger.warning(

@@ -1165,6 +1165,12 @@ async def send_staged_embedding(
         if not sent:
             return False
 
+        if sent is server_module.SEND_ALREADY_COMPLETED:
+            # The request was released after this exact destination had
+            # already received its bytes (the response was lost). Counting it
+            # again would recreate _rid_to_send_done, which the sweeper no
+            # longer tracks (its _pending_at was discarded).
+            return True
         receive_count = request.get("receive_count")
         if receive_count:
             destination_endpoint = NetworkAddress(

@@ -494,6 +494,30 @@ class SharedEmbeddingArena:
                 excess = len(self._failed) - _STATE_KEEP
                 for rid in list(self._failed)[:excess]:
                     self._failed.pop(rid, None)
+            # ACKs from requests that never received a slot (metadata pull
+            # failed, oversize, allocation timeout) have no slot to reap, so
+            # the owner would keep their _acks_seen entries forever. Keep the
+            # early-ACK case: a rid that may still be allocated (pending,
+            # published, assigned or live slot) retains its tally.
+            if self.is_owner:
+                for rid in list(self._acks_seen):
+                    if rid in self._slots:
+                        continue
+                    if rid in self._dead:
+                        self._acks_seen.pop(rid, None)
+                if len(self._acks_seen) > _STATE_KEEP:
+                    for rid in list(self._acks_seen):
+                        if (
+                            rid in self._slots
+                            or rid in self._publish
+                            or rid in self._assigned
+                            or rid in self._requests
+                        ):
+                            continue
+                        if rid in self._dead or rid in self._failed:
+                            self._acks_seen.pop(rid, None)
+                        if len(self._acks_seen) <= _STATE_KEEP:
+                            break
             # Marks whose slot is already gone (TTL, abort) would otherwise
             # accumulate for the life of the process.
             if len(self._drain_unknown) > _STATE_KEEP:

@@ -547,9 +547,12 @@ def test_public_send_answers_released_retry_from_tombstone():
         buffer_address=4096,
         meta_only=False,
     )
+    from sglang.srt.disaggregation.encoder.server import SEND_ALREADY_COMPLETED
+
     assert asyncio.run(enc.send(**args)) is False  # unknown request
     enc._remember_completed_send("req-send", dest.idempotency_key())
-    assert asyncio.run(enc.send(**args)) is True  # exact retry after release
+    got = asyncio.run(enc.send(**args))
+    assert got is SEND_ALREADY_COMPLETED  # exact retry after release
     args2 = dict(args, buffer_address=8192)
     assert asyncio.run(enc.send(**args2)) is False  # different destination
 
@@ -588,3 +591,23 @@ def test_prune_keeps_events_for_rids_still_waiting():
         sa._STATE_KEEP = old_keep
     assert "rid-waiting" in arena._wait_events  # still blocking on DATA_READY
     assert "rid-ready" not in arena._wait_events  # already signalled
+
+
+def test_owner_prunes_acks_for_slotless_failed_requests():
+    """An ACK from a request that never got a slot must not leak on the owner.
+
+    Early ACKs (rid still pending allocation) must be kept.
+    """
+    arena = _bare_arena()
+    arena._acks_seen = {"rid-fail": {0, 1}, "rid-early": {1}}
+    arena._failed = {"rid-fail": "shared arena full"}
+    arena._requests = {"rid-early": object()}
+    arena._slots = {}
+    old_keep = sa._STATE_KEEP
+    sa._STATE_KEEP = 1
+    try:
+        arena._prune_state()
+    finally:
+        sa._STATE_KEEP = old_keep
+    assert "rid-fail" not in arena._acks_seen
+    assert "rid-early" in arena._acks_seen
