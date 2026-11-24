@@ -439,7 +439,7 @@ def _cp_keep_fn_for_items(keep_fn, items):
     """
     if keep_fn is None or not items:
         return None
-    if all(getattr(item, "is_shared_host_embedding", False) for item in items):
+    if all(item.is_shared_host_embedding for item in items):
         return keep_fn
     return None
 
@@ -480,48 +480,63 @@ def _scatter_mm_embedding(
     dest_rows = rows[:num_src_rows]
 
     staged = src
-    if keep_fn is not None and src.is_cpu:
+    filter_rows = keep_fn is not None and src.is_cpu
+    if filter_rows:
         if row_index is None or row_index.numel() != flat_mask.numel():
             # A caller that rewrote input_ids without handing over matching
-            # row indices would silently misplace embeddings; fall back to the
-            # identity mapping and say so once.
+            # row indices cannot be mapped to the global row numbers. An
+            # identity mapping would only be correct for a whole-batch call:
+            # inside a split batch it selects by sub-batch position, so the
+            # ranks' keep sets stop partitioning the rows and the missing row
+            # silently falls back to a text embedding. Disable filtering
+            # instead - every rank stages every row, which is correct.
             global _row_index_mismatch_warned
-            if row_index is not None and not _row_index_mismatch_warned:
+            if not _row_index_mismatch_warned:
                 _row_index_mismatch_warned = True
                 logger.warning(
-                    "CP row_index has %d entries for %d rows; falling back to "
-                    "identity row order",
-                    row_index.numel(),
+                    "CP row_index has %s entries for %d rows; disabling CP "
+                    "row filtering for this batch",
+                    None if row_index is None else row_index.numel(),
                     flat_mask.numel(),
                 )
-            row_index = torch.arange(flat_mask.numel(), device=flat_mask.device)
-        # src rows follow mask order, so the same selection indexes both.
-        # One device->host transfer decides everything else: the row count and
-        # the gather indices are then computed on the CPU, without a second
-        # synchronisation for keep.sum().item().
-        keep_cpu = keep_fn(row_index[flat_mask]).cpu()
-        idx_cpu = keep_cpu.nonzero().flatten()
-        kept = int(idx_cpu.numel())
-        if envs.SGLANG_EMBEDDING_POOL_DEBUG_KEEP.get() and torch.distributed.is_initialized():
-            # Every rank keeps a disjoint slice of the same rows; a strategy
-            # change that breaks that would otherwise corrupt output silently.
-            total = torch.tensor([kept], dtype=torch.long, device=dest.device)
-            torch.distributed.all_reduce(total, op=torch.distributed.ReduceOp.SUM)
-            if int(total.item()) != num_src_rows:
-                logger.error(
-                    "CP keep masks do not partition the multimodal rows: "
-                    "ranks kept %d of %d",
-                    int(total.item()),
-                    num_src_rows,
-                )
-        if kept == 0:
-            return 0
+            filter_rows = False
+        else:
+            # src rows follow mask order, so the same selection indexes both.
+            # One device->host transfer decides everything else: the row count
+            # and the gather indices are then computed on the CPU, without a
+            # second synchronisation for keep.sum().item().
+            keep_cpu = keep_fn(row_index[flat_mask]).cpu()
+            idx_cpu = keep_cpu.nonzero().flatten()
+            kept = int(idx_cpu.numel())
+            if kept == 0:
+                return 0
+            if kept == num_src_rows:
+                # Identity selection (e.g. a CP strategy whose predicate keeps
+                # every row): indexing and copying the whole chunk on the host
+                # would only add work.
+                filter_rows = False
+            elif (
+                envs.SGLANG_EMBEDDING_POOL_DEBUG_KEEP.get()
+                and torch.distributed.is_initialized()
+            ):
+                # Every rank keeps a disjoint slice of the same rows; a
+                # strategy change that breaks that would corrupt output.
+                total = torch.tensor([kept], dtype=torch.long, device=dest.device)
+                torch.distributed.all_reduce(total, op=torch.distributed.ReduceOp.SUM)
+                if int(total.item()) != num_src_rows:
+                    logger.error(
+                        "CP keep masks do not partition the multimodal rows: "
+                        "ranks kept %d of %d",
+                        int(total.item()),
+                        num_src_rows,
+                    )
+    if filter_rows:
         staged_cpu = src.index_select(0, idx_cpu)
         dest_rows = dest_rows[keep_cpu.to(dest.device)]
         # Blocking copy: the gathered buffer is pageable and short-lived.
         staged = staged_cpu.to(dest.device, dest.dtype)
     else:
-        staged = staged.to(dest.device, dest.dtype)
+        staged = src.to(dest.device, dest.dtype)
         kept = num_src_rows
 
     dest.index_copy_(0, dest_rows, staged)
@@ -898,15 +913,20 @@ def _embed_mm_inputs_with_split(
         sub_input_ids = torch.cat(sub_slices)
         # The CP shard slices the whole batch, so each sub-batch row must carry
         # its row index in that whole batch, not its index within the group.
-        sub_row_index = torch.cat(
-            [
-                torch.arange(
-                    token_starts[bi],
-                    token_starts[bi] + all_seq_lens[bi],
-                    device=input_ids.device,
-                )
-                for bi in group_batch_indices
-            ]
+        # Only the row-filtering path needs it.
+        sub_row_index = (
+            torch.cat(
+                [
+                    torch.arange(
+                        token_starts[bi],
+                        token_starts[bi] + all_seq_lens[bi],
+                        device=input_ids.device,
+                    )
+                    for bi in group_batch_indices
+                ]
+            )
+            if keep_fn is not None
+            else None
         )
 
         sub_embeds, sub_info = embed_mm_inputs(
@@ -1014,6 +1034,7 @@ def prepare_mm_inputs(
                 else:
                     from sglang.srt.layers.cp.utils import cp_row_keep_fn
 
+                    keep_fn = cp_row_keep_fn(forward_batch)
                     input_embeds, other_info = embed_mm_inputs(
                         mm_inputs_list=mm_inputs_list,
                         extend_prefix_lens=extend_prefix_lens,
@@ -1024,10 +1045,14 @@ def prepare_mm_inputs(
                         data_embedding_func_mapping=data_embedding_funcs,
                         placeholder_tokens=placeholder_tokens,
                         use_deepstack=use_deepstack,
-                        row_index=torch.arange(
-                            input_ids.shape[0], device=input_ids.device
+                        row_index=(
+                            torch.arange(
+                                input_ids.shape[0], device=input_ids.device
+                            )
+                            if keep_fn is not None
+                            else None
                         ),
-                        keep_fn=cp_row_keep_fn(forward_batch),
+                        keep_fn=keep_fn,
                     )
 
             # add for qwen3_vl deepstack

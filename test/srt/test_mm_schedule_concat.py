@@ -64,11 +64,12 @@ def test_non_2d_falls_back():
     assert torch.equal(out, torch.cat([a, b]))
 
 
-def test_view_is_read_only_safe():
-    """Writing through the view must not corrupt the source rows' order."""
+def test_view_aliases_the_source_rows():
+    """The zero-copy path returns a view: writes land in the source storage."""
     base = torch.zeros(4, 3)
     out = _concat_or_view([base[0:2], base[2:4]])
-    assert torch.equal(out, base)
+    out[1, 2] = 7.0
+    assert base[1, 2] == 7.0
     assert out.shape == (4, 3)
 
 

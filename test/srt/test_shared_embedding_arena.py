@@ -71,6 +71,7 @@ def _bare_arena(**overrides) -> SharedEmbeddingArena:
     arena._ack_waiters = []
     arena._acks_ready = []
     arena._acks_seen = {}
+    arena._acks_seen_at = {}
     arena._pending_since = {}
     arena._dead = set()
     arena._dead_order = []
@@ -254,6 +255,39 @@ def test_scatter_stages_only_kept_rows():
     assert torch.count_nonzero(dest[untouched]) == 0
 
 
+def test_all_true_keep_mask_stages_every_row():
+    """An identity CP predicate must behave exactly like no predicate."""
+    hidden = 4
+    src = torch.arange(8 * hidden, dtype=torch.float32).reshape(8, hidden)
+    mask = torch.ones(8, dtype=torch.bool)
+    dest = torch.zeros(8, hidden)
+    keep = lambda rows: torch.ones_like(rows, dtype=torch.bool)
+
+    kept = _scatter_mm_embedding(dest, mask, src, row_index=torch.arange(8), keep_fn=keep)
+    assert kept == 8
+    assert torch.equal(dest, src)
+
+
+def test_row_index_mismatch_disables_row_filtering():
+    """A split batch cannot map local rows to global ones: stage every row.
+
+    Falling back to an identity mapping would select by sub-batch position, so
+    the ranks' keep sets would stop partitioning the rows - a silent wrong
+    embedding. Disabling the filter keeps the output correct.
+    """
+    hidden = 4
+    src = torch.arange(8 * hidden, dtype=torch.float32).reshape(8, hidden)
+    mask = torch.ones(8, dtype=torch.bool)
+    dest = torch.zeros(8, hidden)
+    keep = lambda rows: rows == 0  # only the first row, if filtering applied
+
+    kept = _scatter_mm_embedding(
+        dest, mask, src, row_index=torch.arange(3), keep_fn=keep
+    )
+    assert kept == 8
+    assert torch.equal(dest, src)
+
+
 def test_scatter_returns_zero_when_nothing_kept():
     src = torch.ones(4, 2)
     dest = torch.zeros(4, 2)
@@ -284,6 +318,7 @@ class _FakeDelivery:
 def test_send_to_destination_is_idempotent():
     enc = MMEncoder.__new__(MMEncoder)
     enc.req_states = {}
+    enc._completed_sends = OrderedDict()
     enc.delivery = _FakeDelivery()
     state = ReqState(req_id="r1")
     enc.req_states["r1"] = state
@@ -600,6 +635,7 @@ def test_owner_prunes_acks_for_slotless_failed_requests():
     """
     arena = _bare_arena()
     arena._acks_seen = {"rid-fail": {0, 1}, "rid-early": {1}}
+    arena._acks_seen_at = {"rid-fail": 0.0, "rid-early": 0.0}
     arena._failed = {"rid-fail": "shared arena full"}
     arena._requests = {"rid-early": object()}
     arena._slots = {}
@@ -611,3 +647,47 @@ def test_owner_prunes_acks_for_slotless_failed_requests():
         sa._STATE_KEEP = old_keep
     assert "rid-fail" not in arena._acks_seen
     assert "rid-early" in arena._acks_seen
+
+
+def test_tombstoned_retry_does_not_recreate_the_send_counter(monkeypatch):
+    """send_staged_embedding must not count a retry of an already-sent part.
+
+    After the final release note_send_done() would recreate
+    _rid_to_send_done[req_id]; its _pending_at is gone, so the sweeper never
+    removes it again (visible with receive_count > 1).
+    """
+    from sglang.srt.disaggregation.encoder import runtime, server
+
+    calls = []
+
+    class _Registry:
+        def __init__(self):
+            self._rid_to_send_done = {}
+            self._pending_at = {}
+
+        async def note_send_done(self, *args, **kwargs):
+            calls.append(args)
+
+    class _Enc:
+        async def send(self, **kwargs):
+            return server.SEND_ALREADY_COMPLETED
+
+        async def release_request(self, rid):
+            raise AssertionError("a completed retry must not release again")
+
+    monkeypatch.setattr(server, "meta_registry", _Registry())
+    request = {
+        "req_id": "r-retry",
+        "prefill_host": "10.0.0.1",
+        "embedding_port": 30005,
+        "session_id": "s",
+        "buffer_address": 4096,
+        "meta_only": False,
+        "receive_count": 2,
+    }
+    ok = asyncio.run(
+        runtime.send_staged_embedding(_Enc(), request, release_without_count=False)
+    )
+    assert ok is True
+    assert calls == []
+    assert server.meta_registry._rid_to_send_done == {}

@@ -261,8 +261,19 @@ class EncoderMetaRegistry:
     async def note_send_done(
         self, req_id: str, receive_count: int, destination_endpoint: str
     ) -> None:
-        """Count one destination once; release after every receiver has sent."""
+        """Count one destination once; release after every receiver has sent.
+
+        A tombstoned retry reaches this only through an older code path; the
+        request may already be released, in which case recreating
+        ``_rid_to_send_done`` would leave an entry the sweeper never sees
+        (its ``_pending_at`` is gone).
+        """
         async with rid_lock:
+            if (
+                req_id not in self._pending_at
+                and req_id not in self._rid_to_meta
+            ):
+                return
             completed = self._rid_to_send_done.setdefault(req_id, set())
             completed.add(destination_endpoint)
             all_done = len(completed) >= receive_count
@@ -873,9 +884,7 @@ class MMEncoder:
 
     def _remember_completed_send(self, req_id: str, key: str) -> None:
         now = time.monotonic()
-        tomb = getattr(self, "_completed_sends", None)
-        if tomb is None:  # unit tests build the encoder with __new__
-            self._completed_sends = tomb = OrderedDict()
+        tomb = self._completed_sends
         tomb[self._tombstone_key(req_id, key)] = now
         while tomb:
             oldest_key, oldest_at = next(iter(tomb.items()))
@@ -887,10 +896,7 @@ class MMEncoder:
             tomb.pop(oldest_key, None)
 
     def _send_already_completed(self, req_id: str, key: str) -> bool:
-        tomb = getattr(self, "_completed_sends", None)
-        if tomb is None:
-            return False
-        at = tomb.get(self._tombstone_key(req_id, key))
+        at = self._completed_sends.get(self._tombstone_key(req_id, key))
         return at is not None and time.monotonic() - at <= self._SEND_TOMBSTONE_TTL_S
 
     async def send_to_destination(

@@ -1249,7 +1249,7 @@ class WaitingMMRequestBase(ABC):
                 mm_inputs, self._pool_slot_id
             )
         _mark_keep_device_embedding(mm_inputs)
-        if getattr(self.embedding_pool, "is_shared_host", False):
+        if self.embedding_pool.is_shared_host:
             _mark_shared_host_embeddings(mm_inputs)
         # Detach so _cleanup_gpu_buffer no-ops; the lease/finalizer now owns release.
         self._pool_slot_id = None
@@ -1591,7 +1591,7 @@ class WaitingRDMARequest(WaitingMMRequestBase):
         """
         last_error = None
         timeout = aiohttp.ClientTimeout(
-            total=envs.SGLANG_ENCODER_SEND_TIMEOUT_S.get()
+            total=envs.SGLANG_ENCODER_SEND_HTTP_TIMEOUT_S.get()
         )
         for attempt in range(attempts):
             try:
@@ -2287,6 +2287,9 @@ class EmbeddingPool:
     _ALIGN = 256
     # Arbitrary; how often a blocked alloc() re-checks deferred releases.
     _DEFERRED_POLL_S = 0.001
+    # A GPU pool holds the full embedding on every rank; CP row filtering is
+    # only valid for the shared host arena (see SharedEmbeddingArena).
+    is_shared_host = False
 
     def __init__(self, gpu_id: int, size_bytes: int, engine=None):
         self.gpu_id = gpu_id

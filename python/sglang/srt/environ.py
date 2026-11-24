@@ -1763,10 +1763,17 @@ class Envs:
     # never reused afterwards: the missing rank may still be blocked inside
     # /send, so its RDMA write could land at any time.
     SGLANG_EMBEDDING_POOL_SLOT_TTL_S = EnvFloat(600.0)
+    # How long the owner may keep an early ACK for a rid that has no slot and
+    # no pending allocation. ACKs from requests that failed before the owner
+    # allocated (metadata error, oversize) would otherwise stay in _acks_seen
+    # forever; the grace keeps the legitimate early-ACK case (peer failed
+    # before the owner's receive thread reached request_slot).
+    SGLANG_EMBEDDING_POOL_ACK_GRACE_S = EnvFloat(600.0)
     # Upper bound on one /send HTTP call (the RDMA itself). Without it a slow
     # encoder can pin a receive thread -- and therefore a slot -- for the
-    # generic 1800s encoder HTTP timeout.
-    SGLANG_ENCODER_SEND_TIMEOUT_S = EnvFloat(60.0)
+    # generic 1800s encoder HTTP timeout. (Formerly SGLANG_ENCODER_SEND_TIMEOUT_S,
+    # which read like the metadata TTL SGLANG_ENCODER_SEND_TIMEOUT.)
+    SGLANG_ENCODER_SEND_HTTP_TIMEOUT_S = EnvFloat(60.0)
     # Periodic inflight/free-fragment snapshot (0 disables).
     SGLANG_EMBEDDING_POOL_STATS_INTERVAL_S = EnvFloat(120.0)
     # Backpressure: 0 = unbounded; >0 = refuse new shared slots beyond this

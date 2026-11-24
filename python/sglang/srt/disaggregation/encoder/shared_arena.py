@@ -144,6 +144,7 @@ class SharedEmbeddingArena:
         self._acks_ready: List[str] = []
         # ack sets the owner has seen so far, rid -> {rank}
         self._acks_seen: Dict[str, Set[int]] = {}
+        self._acks_seen_at: Dict[str, float] = {}
         # owner: request deadlines so a stuck alloc cannot hang a receive thread
         self._pending_since: Dict[str, float] = {}
         self._dead: Set[str] = set()
@@ -500,13 +501,31 @@ class SharedEmbeddingArena:
             # early-ACK case: a rid that may still be allocated (pending,
             # published, assigned or live slot) retains its tally.
             if self.is_owner:
+                now = time.monotonic()
+                grace = envs.SGLANG_EMBEDDING_POOL_ACK_GRACE_S.get()
                 for rid in list(self._acks_seen):
-                    if rid in self._slots:
+                    if (
+                        rid in self._slots
+                        or rid in self._publish
+                        or rid in self._assigned
+                        or rid in self._requests
+                    ):
+                        # A slot exists or may still be allocated/announced:
+                        # the tally is still needed (early ACK case).
                         continue
-                    if rid in self._dead:
+                    if (
+                        rid in self._dead
+                        or rid in self._failed
+                        or now - self._acks_seen_at.get(rid, now) > grace
+                    ):
                         self._acks_seen.pop(rid, None)
+                        self._acks_seen_at.pop(rid, None)
+                # Hard cap: evict the oldest slotless tallies first. Losing one
+                # only delays that range's reaping to the slot TTL.
                 if len(self._acks_seen) > _STATE_KEEP:
-                    for rid in list(self._acks_seen):
+                    for rid, _ts in sorted(
+                        self._acks_seen_at.items(), key=lambda kv: kv[1]
+                    ):
                         if (
                             rid in self._slots
                             or rid in self._publish
@@ -514,8 +533,8 @@ class SharedEmbeddingArena:
                             or rid in self._requests
                         ):
                             continue
-                        if rid in self._dead or rid in self._failed:
-                            self._acks_seen.pop(rid, None)
+                        self._acks_seen.pop(rid, None)
+                        self._acks_seen_at.pop(rid, None)
                         if len(self._acks_seen) <= _STATE_KEEP:
                             break
             # Marks whose slot is already gone (TTL, abort) would otherwise
@@ -560,6 +579,7 @@ class SharedEmbeddingArena:
         with self._lock:
             for rid, safe_reuse in acks or ():
                 self._acks_seen.setdefault(rid, set()).add(rank)
+                self._acks_seen_at.setdefault(rid, time.monotonic())
                 if not safe_reuse:
                     self._reuse_unsafe.add(rid)
             for rid in unsafe or ():
@@ -696,6 +716,7 @@ class SharedEmbeddingArena:
                         self._free_slot_locked(slot, quarantine=False)
                         self._immediate_frees += 1
                     self._acks_seen.pop(rid, None)
+                    self._acks_seen_at.pop(rid, None)
                     self._drain_unknown.discard(rid)
                     self._reuse_unsafe.discard(rid)
                 elif ttl > 0 and now - slot.allocated_at > ttl:
