@@ -428,6 +428,21 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         return pad_mm_tokens(input_ids, mm_inputs)
 
 
+# Aggregated stage timings for the shared-host staging path. PROFILE=1
+# records enqueue times (no extra synchronisation); PROFILE=2 blocks after the
+# H2D and the device copy so the numbers are real device times (it distorts
+# throughput, use it only for a breakdown run).
+_scatter_stats = {
+    "n": 0,
+    "setup_ms": 0.0,
+    "select_ms": 0.0,
+    "h2d_ms": 0.0,
+    "copy_ms": 0.0,
+    "h2d_mb": 0.0,
+}
+_SCATTER_LOG_EVERY = 200
+
+
 def _cp_keep_fn_for_items(keep_fn, items):
     """CP row filtering applies only to shared-host-arena embeddings.
 
@@ -530,18 +545,54 @@ def _scatter_mm_embedding(
                         int(total.item()),
                         num_src_rows,
                     )
+    t_stage = time.perf_counter()
+    select_s = 0.0
     if filter_rows:
         staged_cpu = src.index_select(0, idx_cpu)
+        select_s = time.perf_counter() - t_stage
         dest_rows = dest_rows[keep_cpu.to(dest.device)]
         # Blocking copy: the gathered buffer is pageable and short-lived.
+        t_h2d = time.perf_counter()
         staged = staged_cpu.to(dest.device, dest.dtype)
     else:
+        select_s = 0.0
+        t_h2d = time.perf_counter()
         staged = src.to(dest.device, dest.dtype)
         kept = num_src_rows
+    h2d_s = time.perf_counter() - t_h2d
+    if profile >= 2:
+        # Blocking device copy done: measure the real transfer time.
+        torch.cuda.synchronize(dest.device)
+        h2d_s = time.perf_counter() - t_h2d
 
+    t_copy = time.perf_counter()
     dest.index_copy_(0, dest_rows, staged)
+    if profile >= 2:
+        torch.cuda.synchronize(dest.device)
+    copy_s = time.perf_counter() - t_copy
     if profile:
         row_bytes = src.size(1) * src.element_size() if src.dim() > 1 else 0
+        st = _scatter_stats
+        st["n"] += 1
+        st["setup_ms"] += (t_stage - t_start) * 1000.0
+        st["select_ms"] += select_s * 1000.0
+        st["h2d_ms"] += h2d_s * 1000.0
+        st["copy_ms"] += copy_s * 1000.0
+        st["h2d_mb"] += kept * row_bytes / (1024 * 1024)
+        if st["n"] % _SCATTER_LOG_EVERY == 0:
+            n = st["n"]
+            logger.info(
+                "[pool-profile] scatter-agg n=%d setup_ms=%.2f sel_ms=%.2f "
+                "h2d_ms=%.2f copy_ms=%.2f h2d_mb=%.1f deep=%s",
+                n,
+                st["setup_ms"] / n,
+                st["select_ms"] / n,
+                st["h2d_ms"] / n,
+                st["copy_ms"] / n,
+                st["h2d_mb"] / n,
+                profile >= 2,
+            )
+    if profile:
         logger.info(
             "[pool-profile] scatter src=%s rows=%d kept=%d h2d=%.1fMB total_ms=%.2f",
             "host" if src.is_cpu else "device",

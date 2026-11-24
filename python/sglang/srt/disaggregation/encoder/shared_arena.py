@@ -154,6 +154,13 @@ class SharedEmbeddingArena:
         self._peak_inflight = 0
         self._alloc_waits = 0
         self._alloc_timeouts = 0
+        # Scheduling cost of the two blocking waits (PROFILE only).
+        self._alloc_wait_sum = 0.0
+        self._alloc_wait_max = 0.0
+        self._alloc_wait_n = 0
+        self._ready_wait_sum = 0.0
+        self._ready_wait_max = 0.0
+        self._ready_wait_n = 0
         self._force_frees = 0
         self._abandoned_bytes = 0
         # slots returned without the reuse delay (normal completions)
@@ -221,6 +228,15 @@ class SharedEmbeddingArena:
             if assigned is not None:
                 return assigned
             self._requests[rid] = req
+        if self.is_owner:
+            # Allocate here instead of waiting for the scheduler to call
+            # tick(): a request that arrives during a long prefill batch would
+            # otherwise wait up to a full iteration (measured: 0.25-1.1s for
+            # the owner). Peers still learn the assignment on the next tick.
+            # _owner_allocate takes the lock itself and resolves this rank's
+            # waiter in place.
+            self._owner_allocate([(rid, nbytes)])
+        t_wait = time.monotonic()
         if not req.event.wait(timeout):
             with self._lock:
                 self._requests.pop(rid, None)
@@ -231,7 +247,11 @@ class SharedEmbeddingArena:
                 nbytes // (1024 * 1024),
                 timeout,
             )
+            if envs.SGLANG_EMBEDDING_POOL_PROFILE.get():
+                self._note_alloc_wait(time.monotonic() - t_wait)
             return None
+        if envs.SGLANG_EMBEDDING_POOL_PROFILE.get():
+            self._note_alloc_wait(time.monotonic() - t_wait)
         with self._lock:
             self._requests.pop(rid, None)
         if req.error is not None:
@@ -245,6 +265,18 @@ class SharedEmbeddingArena:
     # ------------------------------------------------------------------ #
     # readiness / failure
     # ------------------------------------------------------------------ #
+    def _note_alloc_wait(self, seconds: float) -> None:
+        with self._lock:
+            self._alloc_wait_sum += seconds
+            self._alloc_wait_max = max(self._alloc_wait_max, seconds)
+            self._alloc_wait_n += 1
+
+    def _note_ready_wait(self, seconds: float) -> None:
+        with self._lock:
+            self._ready_wait_sum += seconds
+            self._ready_wait_max = max(self._ready_wait_max, seconds)
+            self._ready_wait_n += 1
+
     def _signal_waiters_locked(self, rid: str) -> None:
         event = self._wait_events.get(rid)
         if event is not None:
@@ -287,13 +319,18 @@ class SharedEmbeddingArena:
             if rid in self._failed:
                 return False
             event = self._wait_events.setdefault(rid, threading.Event())
+        t_wait = time.monotonic()
         if not event.wait(timeout):
             with self._lock:
                 # Keep the event if the answer arrived just after the wait:
                 # the next call returns from the state check above.
                 if rid not in self._data_ready and rid not in self._failed:
                     self._wait_events.pop(rid, None)
+            if envs.SGLANG_EMBEDDING_POOL_PROFILE.get():
+                self._note_ready_wait(time.monotonic() - t_wait)
             return False
+        if envs.SGLANG_EMBEDDING_POOL_PROFILE.get():
+            self._note_ready_wait(time.monotonic() - t_wait)
         with self._lock:
             return rid in self._data_ready
 
@@ -833,7 +870,9 @@ class SharedEmbeddingArena:
                 "SharedEmbeddingArena stats: inflight=%dMB/%dMB slots=%d "
                 "free_segs=%d reqs=%d ack_waiters=%d peak=%dMB waits=%d "
                 "timeouts=%d force_frees=%d abandoned=%dMB "
-                "quarantine=%dMB immediate_frees=%d owner=%s",
+                "quarantine=%dMB immediate_frees=%d "
+                "alloc_wait_avg=%.2fms alloc_wait_max=%.2fms(n=%d) "
+                "ready_wait_avg=%.2fms ready_wait_max=%.2fms(n=%d) owner=%s",
                 self._total_inflight // (1024 * 1024),
                 self.size_bytes // (1024 * 1024),
                 len(self._slots),
@@ -847,6 +886,20 @@ class SharedEmbeddingArena:
                 self._abandoned_bytes // (1024 * 1024),
                 sum(length for _, _, length in self._quarantine) // (1024 * 1024),
                 self._immediate_frees,
+                (
+                    self._alloc_wait_sum / self._alloc_wait_n * 1000.0
+                    if self._alloc_wait_n
+                    else 0.0
+                ),
+                self._alloc_wait_max * 1000.0,
+                self._alloc_wait_n,
+                (
+                    self._ready_wait_sum / self._ready_wait_n * 1000.0
+                    if self._ready_wait_n
+                    else 0.0
+                ),
+                self._ready_wait_max * 1000.0,
+                self._ready_wait_n,
                 self.is_owner,
             )
 

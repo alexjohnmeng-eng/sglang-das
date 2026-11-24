@@ -775,3 +775,50 @@ def test_reap_paths_clear_both_ack_maps():
     assert "rid-ttl" in arena._dead
     assert "rid-ttl" not in arena._acks_seen
     assert "rid-ttl" not in arena._acks_seen_at
+
+
+def test_owner_allocates_without_waiting_for_a_tick():
+    """A local request must not wait for the scheduler to call tick().
+
+    Requests that arrive during a long prefill batch used to wait up to a
+    full iteration (measured 0.25-1.1s) before the owner allocated.
+    """
+    import time as _time
+
+    arena = _bare_arena(is_owner=True)
+    result = {}
+
+    def poll():
+        t0 = _time.monotonic()
+        result["slot"] = arena.request_slot("rid-own", 4096, timeout=5)
+        result["elapsed"] = _time.monotonic() - t0
+
+    thread = threading.Thread(target=poll)
+    thread.start()
+    thread.join(timeout=2)
+    assert result.get("slot") is not None
+    assert result["elapsed"] < 0.5  # no tick() was ever called
+    assert "rid-own" in arena._assigned
+    assert "rid-own" in arena._publish  # peers learn on their next tick
+
+
+def test_peer_still_waits_for_the_published_assignment():
+    arena = _bare_arena(is_owner=False)
+    result = {}
+
+    def poll():
+        result["slot"] = arena.request_slot("rid-peer2", 4096, timeout=0.3)
+
+    thread = threading.Thread(target=poll)
+    thread.start()
+    thread.join(timeout=2)
+    assert result["slot"] is None  # nothing publishes on a peer
+    assert arena._alloc_timeouts == 1
+
+
+def test_full_arena_keeps_the_owner_request_pending():
+    arena = _bare_arena(is_owner=True, _free=[])
+    assert arena.request_slot("rid-full", 4096, timeout=0.2) is None
+    # The waiter is reaped on timeout; the rid is not assigned or published.
+    assert "rid-full" not in arena._assigned
+    assert "rid-full" not in arena._publish
