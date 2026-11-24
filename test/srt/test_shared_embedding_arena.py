@@ -747,3 +747,31 @@ def test_split_fast_path_forwards_whole_batch_row_index(monkeypatch):
     run()
     assert calls["keep_fn"] is None
     assert calls["row_index"] is None
+
+
+def test_reap_paths_clear_both_ack_maps():
+    """Normal completion and TTL abandon must both retire the timestamp map."""
+    import time as _time
+
+    # Normal completion: every rank acked.
+    arena = _bare_arena()
+    now = _time.monotonic()
+    arena._slots = {"rid-ok": sa._Slot(4096, 4096, "rid-ok", now)}
+    arena._acks_seen = {"rid-ok": {0, 1}}
+    arena._acks_seen_at = {"rid-ok": now}
+    arena._owner_reap()
+    assert "rid-ok" not in arena._slots
+    assert "rid-ok" not in arena._acks_seen
+    assert "rid-ok" not in arena._acks_seen_at  # the leak this guards
+
+    # TTL abandon: one rank never acked and the slot outlived its TTL.
+    arena = _bare_arena()
+    ttl = sa.envs.SGLANG_EMBEDDING_POOL_SLOT_TTL_S.get()
+    arena._slots = {"rid-ttl": sa._Slot(8192, 4096, "rid-ttl", now - ttl - 1)}
+    arena._acks_seen = {"rid-ttl": {0}}
+    arena._acks_seen_at = {"rid-ttl": now - ttl - 1}
+    arena._owner_reap()
+    assert "rid-ttl" not in arena._slots
+    assert "rid-ttl" in arena._dead
+    assert "rid-ttl" not in arena._acks_seen
+    assert "rid-ttl" not in arena._acks_seen_at

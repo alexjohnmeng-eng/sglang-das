@@ -205,6 +205,11 @@ class EnvFloat(EnvField):
             raise ValueError(f'"{value}" is not a valid float value')
 
 
+
+class EnvFloatWithAlias(_DeprecatedEnvFallback, EnvFloat):
+    pass
+
+
 class GateGemvMode(IntEnum):
     """Small-batch Inkling gate linear implementation.
 
@@ -1773,7 +1778,9 @@ class Envs:
     # encoder can pin a receive thread -- and therefore a slot -- for the
     # generic 1800s encoder HTTP timeout. (Formerly SGLANG_ENCODER_SEND_TIMEOUT_S,
     # which read like the metadata TTL SGLANG_ENCODER_SEND_TIMEOUT.)
-    SGLANG_ENCODER_SEND_HTTP_TIMEOUT_S = EnvFloat(60.0)
+    SGLANG_ENCODER_SEND_HTTP_TIMEOUT_S = EnvFloatWithAlias(
+        60.0, deprecated_name="SGLANG_ENCODER_SEND_TIMEOUT_S"
+    )
     # Periodic inflight/free-fragment snapshot (0 disables).
     SGLANG_EMBEDDING_POOL_STATS_INTERVAL_S = EnvFloat(120.0)
     # Backpressure: 0 = unbounded; >0 = refuse new shared slots beyond this

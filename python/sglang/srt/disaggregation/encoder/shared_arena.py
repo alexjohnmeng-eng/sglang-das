@@ -501,6 +501,11 @@ class SharedEmbeddingArena:
             # early-ACK case: a rid that may still be allocated (pending,
             # published, assigned or live slot) retains its tally.
             if self.is_owner:
+                # Anything without a live tally (a future reap path that
+                # forgets one, a TTL abandon) must not leave a timestamp.
+                for rid in list(self._acks_seen_at):
+                    if rid not in self._acks_seen:
+                        self._acks_seen_at.pop(rid, None)
                 now = time.monotonic()
                 grace = envs.SGLANG_EMBEDDING_POOL_ACK_GRACE_S.get()
                 for rid in list(self._acks_seen):
@@ -738,6 +743,7 @@ class SharedEmbeddingArena:
                     )
                     self._free_slot_locked(slot, reusable=False)
                     self._acks_seen.pop(rid, None)
+                    self._acks_seen_at.pop(rid, None)
                     self._drain_unknown.discard(rid)
                     self._dead.add(rid)
                     self._dead_order.append(rid)
