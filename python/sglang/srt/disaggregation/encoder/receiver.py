@@ -2687,6 +2687,12 @@ class MMReceiverBase(ABC):
                         size_bytes=pool_mb * 1024 * 1024,
                         engine=self.embeddings_engine,
                     )
+                    if envs.SGLANG_EMBEDDING_POOL_CTL_IPC.get():
+                        # One prefill instance owns one bootstrap port, so the
+                        # group id is unique per server process.
+                        self.shared_arena.enable_control_channel(
+                            f"bs{get_disagg().encoder_bootstrap_port}"
+                        )
                     self.embedding_pool = self.shared_arena
                 elif sharing != "off":
                     raise ValueError(

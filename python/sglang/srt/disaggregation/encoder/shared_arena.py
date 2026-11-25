@@ -35,6 +35,8 @@ from __future__ import annotations
 
 import threading
 import time
+
+from sglang.srt.disaggregation.encoder.arena_control import ArenaControlChannel
 import weakref
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -100,6 +102,8 @@ class SharedEmbeddingArena:
         self.rank = rank_in_group
         self.world_size = group.world_size
         self.is_owner = rank_in_group == 0
+        # Out-of-band control plane (Unix sockets); tick() stays as fallback.
+        self._ctl: Optional[ArenaControlChannel] = None
         self.size_bytes = size_bytes
         self.engine = engine
 
@@ -265,6 +269,103 @@ class SharedEmbeddingArena:
     # ------------------------------------------------------------------ #
     # readiness / failure
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # out-of-band control plane
+    # ------------------------------------------------------------------ #
+    def enable_control_channel(self, group_id: str) -> None:
+        """Start the Unix-socket control plane (tick() remains the fallback).
+
+        Messages are idempotent on both sides, so a socket delivery racing the
+        tick payload is always safe.
+        """
+        if self._ctl is not None:
+            return
+        try:
+            self._ctl = ArenaControlChannel(
+                rank=self.rank,
+                world_size=self.world_size,
+                group_id=group_id,
+                apply_fn=self._apply_control_message,
+            )
+            self._ctl.start()
+        except Exception:
+            logger.exception(
+                "SharedEmbeddingArena: control channel disabled for rank=%d",
+                self.rank,
+            )
+            self._ctl = None
+
+    def _ctl_publish(self, state: str, rid: str, **fields) -> None:
+        """Owner broadcasts a state change; peers report back to the owner."""
+        if self._ctl is None:
+            return
+        msg = {"state": state, "rid": rid, **fields}
+        if self.is_owner or state == "ACK":
+            self._ctl.broadcast(msg)
+        else:
+            self._ctl.send(0, msg)  # the owner is rank 0 in the arena group
+
+    def _apply_control_message(self, msg: dict) -> None:
+        state = msg.get("state")
+        rid = msg.get("rid", "")
+        if state == "ASSIGNED":
+            self._adopt(rid, (int(msg["offset"]), int(msg["nbytes"])))
+        elif state == "READY":
+            with self._lock:
+                if rid not in self._data_ready:
+                    self._data_ready.add(rid)
+                self._signal_waiters_locked(rid)
+        elif state == "FAILED":
+            with self._lock:
+                if rid not in self._failed:
+                    self._failed[rid] = msg.get("reason") or "shared arena failure"
+                self._signal_waiters_locked(rid)
+        elif state == "FREED":
+            with self._lock:
+                self._assigned.pop(rid, None)
+                self._data_ready.discard(rid)
+                self._failed.pop(rid, None)
+                self._requests.pop(rid, None)
+                self._wait_events.pop(rid, None)
+        elif state == "ACK":
+            # Owner side only: fold the peer's ack and reap immediately.
+            # _record_peer_ack/_owner_reap take the arena lock themselves.
+            if not self.is_owner:
+                return
+            self._record_peer_ack(
+                int(msg.get("rank", -1)),
+                [(rid, bool(msg.get("safe_reuse")))],
+                [rid] if msg.get("drain_unknown") else [],
+            )
+            self._owner_reap()
+
+    def _ctl_send_ack(self, rid: str, safe_reuse: bool, drain_unknown: bool) -> None:
+        self._ctl_publish(
+            "ACK",
+            rid,
+            rank=self.rank,
+            safe_reuse=safe_reuse,
+            drain_unknown=drain_unknown,
+        )
+        if self.is_owner:
+            self._record_peer_ack(
+                self.rank, [(rid, safe_reuse)], [rid] if drain_unknown else []
+            )
+            self._owner_reap()
+
+    def _ctl_send_ack_after_fence(
+        self,
+        rid: str,
+        ready_event,
+        safe_reuse: bool,
+        drain_unknown: bool,
+    ) -> None:
+        try:
+            ready_event.synchronize()
+        except Exception:
+            pass
+        self._ctl_send_ack(rid, safe_reuse, drain_unknown)
+
     def _note_alloc_wait(self, seconds: float) -> None:
         with self._lock:
             self._alloc_wait_sum += seconds
@@ -288,6 +389,8 @@ class SharedEmbeddingArena:
                 self._data_ready.add(rid)
                 self._ready_out.append(rid)
             self._signal_waiters_locked(rid)
+        if self.is_owner:
+            self._ctl_publish("READY", rid)
 
     def _mark_failed_locked(self, rid: str, reason: str) -> None:
         """Record FAILED once, in the state *and* in the tick delta.
@@ -306,6 +409,7 @@ class SharedEmbeddingArena:
     def mark_failed(self, rid: str, reason: str = "") -> None:
         with self._lock:
             self._mark_failed_locked(rid, reason or "shared arena failure")
+        self._ctl_publish("FAILED", rid, reason=self._failed.get(rid, ""))
 
     def is_data_ready(self, rid: str) -> bool:
         with self._lock:
@@ -378,8 +482,25 @@ class SharedEmbeddingArena:
                 self._unsafe_acks.append(rid)
             if ready_event is not None and not ready_event.query():
                 self._ack_waiters.append((rid, ready_event, safe_reuse))
+                ack_ready = False
             else:
                 self._acks_ready.append((rid, safe_reuse))
+                ack_ready = True
+        if self._ctl is not None:
+            # Out-of-band ack: peers report to the owner, the owner folds its
+            # own ack and reaps right away. The queued copies above are kept
+            # for the tick fallback and are idempotent. An ack whose fence has
+            # not completed yet is delivered by a small waiter thread once the
+            # event fires, so the slot is not held until the next tick.
+            if ack_ready:
+                self._ctl_send_ack(rid, safe_reuse, drain_unknown)
+            else:
+                threading.Thread(
+                    target=self._ctl_send_ack_after_fence,
+                    args=(rid, ready_event, safe_reuse, drain_unknown),
+                    daemon=True,
+                    name=f"arena-ctl-ack-r{self.rank}",
+                ).start()
 
     def release_on_gc(self, obj, rid: str):
         return weakref.finalize(obj, self.release, rid)
@@ -673,6 +794,10 @@ class SharedEmbeddingArena:
                 self._publish[rid] = (offset, nbytes)
                 self._acks_seen.setdefault(rid, set())
                 self._total_inflight += _align_up(nbytes, _ALIGN)
+                if self._ctl is not None:
+                    self._ctl_publish(
+                        "ASSIGNED", rid, offset=offset, nbytes=nbytes
+                    )
                 if self._total_inflight > self._peak_inflight:
                     bucket = self._total_inflight // (512 * 1024 * 1024)
                     if bucket > self._peak_inflight // (512 * 1024 * 1024):
@@ -700,6 +825,7 @@ class SharedEmbeddingArena:
             )
             self._mark_failed_locked(rid, reason)
             self._alloc_timeouts += 1
+            self._ctl_publish("FAILED", rid, reason=reason)
             req = self._requests.get(rid)
             if req is not None:
                 req.fail(reason)
@@ -804,6 +930,8 @@ class SharedEmbeddingArena:
             else:
                 self._insert_free_locked(slot.offset, aligned)
         self._freed_pending.append(slot.rid)
+        if self._ctl is not None:
+            self._ctl_publish("FREED", slot.rid)
 
     # ------------------------------------------------------------------ #
     # free list (owner only)

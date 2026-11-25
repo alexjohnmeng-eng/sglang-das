@@ -1787,6 +1787,10 @@ class Envs:
     # many in-flight requests (the request queues, then fails after the alloc
     # timeout) instead of letting the encoder encode into a full arena.
     SGLANG_EMBEDDING_POOL_MAX_INFLIGHT = EnvInt(0)
+    # Out-of-band arena control plane over Unix domain sockets (assignment /
+    # DATA_READY / FAILED / FREED / ack). tick() stays as the fallback; set 0
+    # to force the collective-only behaviour.
+    SGLANG_EMBEDDING_POOL_CTL_IPC = EnvBool(True)
     # A freed shared slot is only handed out again after this delay, so an
     # RDMA write that is still draining (or a laggard reader) cannot land in
     # a slot that already belongs to the next request.

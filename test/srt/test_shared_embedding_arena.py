@@ -54,6 +54,7 @@ def _bare_arena(**overrides) -> SharedEmbeddingArena:
     arena.rank = 0
     arena.world_size = 2
     arena.is_owner = True
+    arena._ctl = None
     arena.size_bytes = 256 * 1024 * 1024
     arena._lock = threading.Lock()
     arena._slots = {}
@@ -822,3 +823,73 @@ def test_full_arena_keeps_the_owner_request_pending():
     # The waiter is reaped on timeout; the rid is not assigned or published.
     assert "rid-full" not in arena._assigned
     assert "rid-full" not in arena._publish
+
+
+def test_control_channel_end_to_end():
+    """ASSIGNED / READY / ACK flow over Unix sockets, tick never runs."""
+    import os
+    import time as _time
+
+    from sglang.srt.disaggregation.encoder.shared_arena import SharedEmbeddingArena
+
+    gid = f"testctl_{os.getpid()}"
+    owner = _bare_arena(is_owner=True)
+    peer = _bare_arena(is_owner=False, rank=1)
+    owner.enable_control_channel(gid)
+    peer.enable_control_channel(gid)
+    try:
+        # 1. owner-side allocation reaches the peer without any tick
+        got = {}
+
+        def peer_request():
+            got["slot"] = peer.request_slot("rid-ctl", 4096, timeout=5)
+
+        thread = threading.Thread(target=peer_request)
+        thread.start()
+        slot = owner.request_slot("rid-ctl", 4096, timeout=5)
+        thread.join(timeout=2)
+        assert slot is not None
+        assert got["slot"] == slot  # same (offset, nbytes)
+
+        # 2. READY is delivered immediately
+        owner.mark_data_ready("rid-ctl")
+        t0 = _time.monotonic()
+        assert peer.wait_data_ready("rid-ctl", timeout=5) is True
+        assert _time.monotonic() - t0 < 1.0
+
+        # 3. both acks -> the owner reaps the slot without a tick
+        peer.release("rid-ctl", safe_reuse=True)
+        owner.release("rid-ctl", safe_reuse=True)
+        deadline = _time.monotonic() + 2
+        while "rid-ctl" in owner._slots and _time.monotonic() < deadline:
+            _time.sleep(0.02)
+        assert "rid-ctl" not in owner._slots
+        assert owner._immediate_frees >= 1
+        assert "rid-ctl" not in owner._acks_seen
+    finally:
+        if owner._ctl is not None:
+            owner._ctl.stop()
+        if peer._ctl is not None:
+            peer._ctl.stop()
+
+
+def test_control_channel_failure_notification():
+    import os
+    import time as _time
+
+    gid = f"testctl_fail_{os.getpid()}"
+    owner = _bare_arena(is_owner=True)
+    peer = _bare_arena(is_owner=False, rank=1)
+    owner.enable_control_channel(gid)
+    peer.enable_control_channel(gid)
+    try:
+        peer.mark_failed("rid-f", "encoder refused")
+        deadline = _time.monotonic() + 2
+        while "rid-f" not in owner._failed and _time.monotonic() < deadline:
+            _time.sleep(0.02)
+        assert "rid-f" in owner._failed  # owner learns without tick
+    finally:
+        if owner._ctl is not None:
+            owner._ctl.stop()
+        if peer._ctl is not None:
+            peer._ctl.stop()
