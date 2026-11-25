@@ -37,6 +37,7 @@ from typing import Callable, Deque, Dict, Optional, Set, Tuple
 logger = logging.getLogger(__name__)
 
 _CTL_DIR = "/tmp/sglang_arena_ctl"
+_TIMER_INTERVAL_S = 30.0
 _HEADER = struct.Struct("<I")
 _SEND_RETRY = 3
 
@@ -74,11 +75,13 @@ class ArenaControlChannel:
         world_size: int,
         group_id: str,
         apply_fn: Callable[[dict], None],
+        on_timer: Optional[Callable[[], None]] = None,
     ):
         self.rank = rank
         self.world_size = world_size
         self.group_id = group_id
         self._apply_fn = apply_fn
+        self._on_timer = on_timer
         self._ctl_dir = f"{_CTL_DIR}/{group_id}"
         self._sock_path = f"{self._ctl_dir}/rank{rank}.sock"
         self._outq: Deque[Tuple[int, dict]] = deque()
@@ -155,24 +158,23 @@ class ArenaControlChannel:
                         return
                 rank, msg = self._outq.popleft()
             payload = json.dumps(msg).encode()
-            for attempt in range(_SEND_RETRY):
+            attempt = 0
+            while not self._stopped.is_set():
                 sock = self._connect(rank)
-                if sock is None:
-                    time.sleep(0.2 * (attempt + 1))
-                    continue
-                try:
-                    _framed_send(sock, payload)
-                    break
-                except OSError:
-                    self._drop_conn(rank)
-                    if attempt + 1 == _SEND_RETRY:
-                        logger.warning(
-                            "Arena control: dropping message for rank=%d "
-                            "after %d failures: %s",
-                            rank,
-                            _SEND_RETRY,
-                            msg.get("state"),
-                        )
+                if sock is not None:
+                    try:
+                        _framed_send(sock, payload)
+                        break
+                    except OSError:
+                        self._drop_conn(rank)
+                attempt += 1
+                if attempt == _SEND_RETRY:
+                    logger.warning(
+                        "Arena control: rank=%d send retrying (%s)",
+                        rank,
+                        msg.get("state"),
+                    )
+                time.sleep(min(0.2 * attempt, 1.0))
 
     def _connect(self, rank: int) -> Optional[socket.socket]:
         with self._conns_lock:
@@ -218,21 +220,30 @@ class ArenaControlChannel:
             return
         server.listen(8)
         server.settimeout(0.5)
+        timer_deadline = time.monotonic() + _TIMER_INTERVAL_S
         while not self._stopped.is_set():
             try:
                 conn, _ = server.accept()
             except socket.timeout:
-                continue
+                pass
             except OSError:
                 if self._stopped.is_set():
                     break
                 continue
-            threading.Thread(
-                target=self._serve_conn,
-                args=(conn,),
-                daemon=True,
-                name=f"arena-ctl-msg-r{self.rank}",
-            ).start()
+            else:
+                threading.Thread(
+                    target=self._serve_conn,
+                    args=(conn,),
+                    daemon=True,
+                    name=f"arena-ctl-msg-r{self.rank}",
+                ).start()
+            now = time.monotonic()
+            if self._on_timer is not None and now >= timer_deadline:
+                timer_deadline = now + _TIMER_INTERVAL_S
+                try:
+                    self._on_timer()
+                except Exception:
+                    logger.exception("Arena control: timer callback failed")
         server.close()
 
     def _serve_conn(self, conn: socket.socket) -> None:

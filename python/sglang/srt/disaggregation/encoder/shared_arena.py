@@ -276,7 +276,9 @@ class SharedEmbeddingArena:
         """Start the Unix-socket control plane (tick() remains the fallback).
 
         Messages are idempotent on both sides, so a socket delivery racing the
-        tick payload is always safe.
+        tick payload is always safe. With SGLANG_EMBEDDING_POOL_TICK_EVERY=0
+        the collective is removed entirely and this channel's timer drives the
+        reap/prune/stats housekeeping tick() used to do.
         """
         if self._ctl is not None:
             return
@@ -286,14 +288,25 @@ class SharedEmbeddingArena:
                 world_size=self.world_size,
                 group_id=group_id,
                 apply_fn=self._apply_control_message,
+                on_timer=self._ctl_on_timer,
             )
             self._ctl.start()
+            if self._tick_disabled():
+                logger.info(
+                    "SharedEmbeddingArena: tick collective disabled for "
+                    "rank=%d; control channel drives housekeeping",
+                    self.rank,
+                )
         except Exception:
             logger.exception(
                 "SharedEmbeddingArena: control channel disabled for rank=%d",
                 self.rank,
             )
             self._ctl = None
+
+    def _ctl_on_timer(self) -> None:
+        if self._tick_disabled():
+            self._tick_housekeeping()
 
     def _ctl_publish(self, state: str, rid: str, **fields) -> None:
         """Owner broadcasts a state change; peers report back to the owner."""
@@ -320,6 +333,11 @@ class SharedEmbeddingArena:
                 if rid not in self._failed:
                     self._failed[rid] = msg.get("reason") or "shared arena failure"
                 self._signal_waiters_locked(rid)
+                req = self._requests.get(rid)
+            if req is not None and not req.event.is_set():
+                # Without tick() nothing else resolves this waiter; fail it now
+                # so the request returns instead of waiting out its timeout.
+                req.fail(self._failed[rid])
         elif state == "FREED":
             with self._lock:
                 self._assigned.pop(rid, None)
@@ -387,7 +405,8 @@ class SharedEmbeddingArena:
         with self._lock:
             if rid not in self._data_ready:
                 self._data_ready.add(rid)
-                self._ready_out.append(rid)
+                if self._deltas_enabled():
+                    self._ready_out.append(rid)
             self._signal_waiters_locked(rid)
         if self.is_owner:
             self._ctl_publish("READY", rid)
@@ -403,7 +422,8 @@ class SharedEmbeddingArena:
         if rid in self._failed:
             return
         self._failed[rid] = reason or "shared arena failure"
-        self._failed_out[rid] = self._failed[rid]
+        if self._deltas_enabled():
+            self._failed_out[rid] = self._failed[rid]
         self._signal_waiters_locked(rid)
 
     def mark_failed(self, rid: str, reason: str = "") -> None:
@@ -478,13 +498,16 @@ class SharedEmbeddingArena:
                 )
                 ready_event = None
         with self._lock:
-            if drain_unknown:
+            deltas = self._deltas_enabled()
+            if drain_unknown and deltas:
                 self._unsafe_acks.append(rid)
             if ready_event is not None and not ready_event.query():
-                self._ack_waiters.append((rid, ready_event, safe_reuse))
+                if deltas:
+                    self._ack_waiters.append((rid, ready_event, safe_reuse))
                 ack_ready = False
             else:
-                self._acks_ready.append((rid, safe_reuse))
+                if deltas:
+                    self._acks_ready.append((rid, safe_reuse))
                 ack_ready = True
         if self._ctl is not None:
             # Out-of-band ack: peers report to the owner, the owner folds its
@@ -508,6 +531,29 @@ class SharedEmbeddingArena:
     # ------------------------------------------------------------------ #
     # the per-iteration collective
     # ------------------------------------------------------------------ #
+    def _deltas_enabled(self) -> bool:
+        """Tick payloads are only maintained while tick() may still run."""
+        return not self._tick_disabled()
+
+    def _tick_disabled(self) -> bool:
+        """No collective at all: the socket control plane carries everything.
+
+        Opt-in via SGLANG_EMBEDDING_POOL_TICK_EVERY=0 with the control channel
+        enabled; without the channel 0 keeps the old every-iteration meaning.
+        Reaping, allocation retries, pruning and stats move to the control
+        channel's timer.
+        """
+        return (
+            self._ctl is not None
+            and envs.SGLANG_EMBEDDING_POOL_TICK_EVERY.get() == 0
+        )
+
+    def _tick_housekeeping(self) -> None:
+        """Periodic work tick() used to drive, now on the control timer."""
+        self._owner_reap()
+        self._prune_state()
+        self._maybe_log_stats()
+
     def _should_tick(self) -> bool:
         """Advance the call counter and decide whether to enter the collective.
 
@@ -535,6 +581,8 @@ class SharedEmbeddingArena:
         them one tick later -- one scheduler iteration, against the hundreds
         of milliseconds an embedding transfer takes.
         """
+        if self._tick_disabled():
+            return
         if not self._should_tick():
             return
         self._drain_acks()
@@ -791,7 +839,8 @@ class SharedEmbeddingArena:
                 slot = _Slot(offset=offset, nbytes=nbytes, rid=rid, allocated_at=now)
                 self._slots[rid] = slot
                 self._assigned[rid] = (offset, nbytes)
-                self._publish[rid] = (offset, nbytes)
+                if self._deltas_enabled():
+                    self._publish[rid] = (offset, nbytes)
                 self._acks_seen.setdefault(rid, set())
                 self._total_inflight += _align_up(nbytes, _ALIGN)
                 if self._ctl is not None:
@@ -849,6 +898,7 @@ class SharedEmbeddingArena:
         ttl = envs.SGLANG_EMBEDDING_POOL_SLOT_TTL_S.get()
         abandon_unsafe = envs.SGLANG_EMBEDDING_POOL_ABANDON_ON_SEND_FAILURE.get()
         now = time.monotonic()
+        freed_any = False
         with self._lock:
             for rid, slot in list(self._slots.items()):
                 acked = self._acks_seen.get(rid, set())
@@ -887,6 +937,7 @@ class SharedEmbeddingArena:
                     self._acks_seen_at.pop(rid, None)
                     self._drain_unknown.discard(rid)
                     self._reuse_unsafe.discard(rid)
+                    freed_any = True
                 elif ttl > 0 and now - slot.allocated_at > ttl:
                     # A rank that never acked is a bug, not a crash (a crash
                     # takes the whole TP group down). The missing rank may
@@ -910,6 +961,18 @@ class SharedEmbeddingArena:
                     self._drain_unknown.discard(rid)
                     self._dead.add(rid)
                     self._dead_order.append(rid)
+                    freed_any = True
+        if freed_any and self._tick_disabled() and self._requests:
+            # tick() used to retry queued allocations every iteration; with
+            # the collective off, a reap that freed space must retry now or a
+            # full-arena request would wait for its own timeout.
+            self._owner_allocate(
+                [
+                    (rid, req.nbytes)
+                    for rid, req in self._requests.items()
+                    if rid not in self._assigned and rid not in self._dead
+                ]
+            )
 
     def _free_slot_locked(
         self, slot: _Slot, reusable: bool = True, quarantine: bool = True
@@ -929,7 +992,8 @@ class SharedEmbeddingArena:
                 )
             else:
                 self._insert_free_locked(slot.offset, aligned)
-        self._freed_pending.append(slot.rid)
+        if self._deltas_enabled():
+            self._freed_pending.append(slot.rid)
         if self._ctl is not None:
             self._ctl_publish("FREED", slot.rid)
 

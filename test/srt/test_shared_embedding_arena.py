@@ -893,3 +893,95 @@ def test_control_channel_failure_notification():
             owner._ctl.stop()
         if peer._ctl is not None:
             peer._ctl.stop()
+
+
+def test_tick_disabled_arena_runs_without_any_collective(monkeypatch):
+    """TICK_EVERY=0 + control channel: everything flows over the socket.
+
+    Allocation, DATA_READY, ack-driven reaping and the full-arena retry that
+    tick used to drive must all work with tick() never called.
+    """
+    import os
+    import time as _time
+
+    gid = f"testtick0_{os.getpid()}"
+    monkeypatch.setattr(
+        sa.envs.SGLANG_EMBEDDING_POOL_TICK_EVERY, "get", lambda: 0
+    )
+    owner = _bare_arena(is_owner=True)
+    peer = _bare_arena(is_owner=False, rank=1)
+    owner.enable_control_channel(gid)
+    peer.enable_control_channel(gid)
+    assert owner._tick_disabled() and peer._tick_disabled()
+    try:
+        got = {}
+
+        def peer_request():
+            got["slot"] = peer.request_slot("rid-t0", 4096, timeout=5)
+
+        thread = threading.Thread(target=peer_request)
+        thread.start()
+        slot = owner.request_slot("rid-t0", 4096, timeout=5)
+        thread.join(timeout=2)
+        assert slot is not None and got["slot"] == slot
+
+        owner.mark_data_ready("rid-t0")
+        assert peer.wait_data_ready("rid-t0", timeout=5) is True
+
+        peer.release("rid-t0", safe_reuse=True)
+        owner.release("rid-t0", safe_reuse=True)
+        deadline = _time.monotonic() + 2
+        while "rid-t0" in owner._slots and _time.monotonic() < deadline:
+            _time.sleep(0.02)
+        assert "rid-t0" not in owner._slots
+
+        # Fill the arena with a live slot, then queue a request on both sides
+        # (in production the owner's receive thread requests the same rid).
+        holder = owner.request_slot("rid-hold", 4096, timeout=5)
+        assert holder is not None
+        # The peer side of the same rid (in production every rank requests it,
+        # so every rank acks it and the owner's reap can free the range).
+        thread_hold = threading.Thread(
+            target=lambda: peer.request_slot("rid-hold", 4096, timeout=5)
+        )
+        thread_hold.start()
+        deadline = _time.monotonic() + 2
+        while "rid-hold" not in peer._assigned and _time.monotonic() < deadline:
+            _time.sleep(0.02)
+        assert "rid-hold" in peer._assigned
+        owner._free = []
+        got.clear(); got_owner = {}
+
+        thread2 = threading.Thread(
+            target=lambda: got.update(
+                slot=peer.request_slot("rid-t1", 4096, timeout=5)
+            )
+        )
+        thread3 = threading.Thread(
+            target=lambda: got_owner.update(
+                slot=owner.request_slot("rid-t1", 4096, timeout=5)
+            )
+        )
+        thread2.start(); thread3.start()
+        _time.sleep(0.2)
+        assert got.get("slot") is None and got_owner.get("slot") is None
+
+        # Release the live slot on both ranks: the ack reap frees space and
+        # the retry hook allocates the queued request without any tick.
+        peer.release("rid-hold", safe_reuse=True)
+        owner.release("rid-hold", safe_reuse=True)
+        deadline = _time.monotonic() + 3
+        while got.get("slot") is None and _time.monotonic() < deadline:
+            _time.sleep(0.05)
+        assert got.get("slot") is not None
+        thread2.join(timeout=2); thread3.join(timeout=2)
+        assert got_owner.get("slot") is not None
+        # Both sides hold the same rid; clean up.
+        owner.release("rid-t1", safe_reuse=True)
+        peer.release("rid-t1", safe_reuse=True)
+        thread_hold.join(timeout=2)
+    finally:
+        if owner._ctl is not None:
+            owner._ctl.stop()
+        if peer._ctl is not None:
+            peer._ctl.stop()
