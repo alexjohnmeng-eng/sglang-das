@@ -100,6 +100,19 @@ class _ReceiveRegistrationRunner:
 _POOL_SLOT_LEASE_MODEL_TYPES = frozenset({"deepseek_v41"})
 
 
+def _arena_ctl_group_id(
+    encoder_bootstrap_port, attn_dp_rank: int, pp_rank: int
+) -> str:
+    """Unique arena control-plane id for one (instance, DP subgroup, PP stage).
+
+    Every rank of the same arena group must derive the same id: they share
+    the bootstrap port, the attention-DP rank of their attn_tp_group and the
+    pipeline stage. Two groups sharing an id would fight over the same
+    ZMQ ipc endpoint and silently steal each other's acks.
+    """
+    return f"bs{encoder_bootstrap_port}_dp{attn_dp_rank}_pp{pp_rank}"
+
+
 def _mark_keep_device_embedding(mm_inputs) -> None:
     """Tell general_mm_embed_routine not to copy embeddings back to CPU."""
     if mm_inputs is None:
@@ -2688,10 +2701,27 @@ class MMReceiverBase(ABC):
                         engine=self.embeddings_engine,
                     )
                     if envs.SGLANG_EMBEDDING_POOL_CTL_IPC.get():
-                        # One prefill instance owns one bootstrap port, so the
-                        # group id is unique per server process.
+                        # The bootstrap port alone is not unique: with
+                        # attention DP every attn_tp subgroup has its own
+                        # rank-0 owner, and every PP stage builds its own
+                        # arena, all sharing the port. Add those ranks so the
+                        # owners cannot unlink each other's owner.ipc.
+                        parallel = get_parallel()
+                        # Mirror the group selection above: only when the
+                        # arena is per attn_tp_group does the DP rank differ
+                        # within one arena group.
+                        attn_dp_rank = (
+                            parallel.attn_dp_rank
+                            if parallel.attn_dp_enabled
+                            and parallel.attn_cp_size == 1
+                            else 0
+                        )
                         self.shared_arena.enable_control_channel(
-                            f"bs{get_disagg().encoder_bootstrap_port}"
+                            _arena_ctl_group_id(
+                                get_disagg().encoder_bootstrap_port,
+                                attn_dp_rank,
+                                self.pp_rank or 0,
+                            )
                         )
                     self.embedding_pool = self.shared_arena
                 elif sharing != "off":

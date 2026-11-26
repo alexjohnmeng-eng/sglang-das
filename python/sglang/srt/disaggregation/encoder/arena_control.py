@@ -24,10 +24,13 @@ Transport layout:
                     identity "rankN" so the owner can route replies to it
                     across reconnects.
 
-Reliability: messages are at-least-once and per-peer ordered. A send to a
-not-yet-connected peer is buffered by the DEALER/ROUTER pipe (bounded by
-HWM, beyond which sends fail with EAGAIN and are retried with backoff), so
-a slow or restarting peer delays delivery but never loses a message. Every
+Reliability: messages are at-least-once and per-peer ordered while the peer
+is reachable. A send to a not-yet-connected peer is buffered by the
+DEALER/ROUTER pipe (bounded by HWM, beyond which sends fail with EAGAIN and
+are retried with backoff), so a slow or restarting peer delays delivery. A
+peer that stays unreachable for _PEER_STALE_S (60s) is declared dead and
+its queued messages are dropped instead of blocking the other peers; the
+arena's alloc/ready/TTL backstops then fail the affected requests. Every
 message is idempotent on the receiving side, so a redelivery (or the tick
 fallback racing the channel) cannot corrupt state.
 

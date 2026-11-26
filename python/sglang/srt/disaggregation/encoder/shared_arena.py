@@ -105,7 +105,7 @@ class SharedEmbeddingArena:
         self.rank = rank_in_group
         self.world_size = group.world_size
         self.is_owner = rank_in_group == 0
-        # Out-of-band control plane (Unix sockets); tick() stays as fallback.
+        # Out-of-band control plane (ZMQ ipc); tick() stays as the fallback.
         self._ctl: Optional[ArenaControlChannel] = None
         self.size_bytes = size_bytes
         self.engine = engine
@@ -147,8 +147,8 @@ class SharedEmbeddingArena:
         # copies of the request state instead of growing without bound
         self._freed_pending: List[str] = []
         # released but not yet acknowledged upward (event-gated)
-        self._ack_waiters: List[Tuple[str, torch.cuda.Event]] = []
-        self._acks_ready: List[str] = []
+        self._ack_waiters: List[Tuple[str, torch.cuda.Event, bool]] = []
+        self._acks_ready: List[Tuple[str, bool]] = []
         # ack sets the owner has seen so far, rid -> {rank}
         self._acks_seen: Dict[str, Set[int]] = {}
         self._acks_seen_at: Dict[str, float] = {}
@@ -254,6 +254,10 @@ class SharedEmbeddingArena:
         if not req.event.wait(timeout):
             with self._lock:
                 self._requests.pop(rid, None)
+                # The pending clock is only consulted for rids still in
+                # _requests; leaving it behind leaks one entry per timed-out
+                # allocation for the process lifetime.
+                self._pending_since.pop(rid, None)
                 self._alloc_timeouts += 1
             logger.error(
                 "SharedEmbeddingArena: slot for rid=%s (%dMB) timed out after %.1fs",
@@ -283,10 +287,10 @@ class SharedEmbeddingArena:
     # out-of-band control plane
     # ------------------------------------------------------------------ #
     def enable_control_channel(self, group_id: str) -> None:
-        """Start the Unix-socket control plane (tick() remains the fallback).
+        """Start the ZMQ ipc control plane (tick() remains the fallback).
 
-        Messages are idempotent on both sides, so a socket delivery racing the
-        tick payload is always safe.
+        Messages are idempotent on both sides, so a control-channel delivery
+        racing the tick payload is always safe.
         """
         if self._ctl is not None:
             return
@@ -338,9 +342,13 @@ class SharedEmbeddingArena:
             with self._lock:
                 if rid in self._freed_seen:
                     return
-                if rid not in self._failed:
-                    self._failed[rid] = msg.get("reason") or "shared arena failure"
-                self._signal_waiters_locked(rid)
+                # Go through the helper so the tick delta is populated as
+                # well: the owner relays peer failures to the other peers in
+                # its next tick payload, and writing _failed directly used to
+                # leave that delta empty.
+                self._mark_failed_locked(
+                    rid, msg.get("reason") or "shared arena failure"
+                )
         elif state == "FREED":
             with self._lock:
                 self._assigned.pop(rid, None)
@@ -354,8 +362,21 @@ class SharedEmbeddingArena:
             # _record_peer_ack/_owner_reap take the arena lock themselves.
             if not self.is_owner:
                 return
+            try:
+                rank = int(msg.get("rank", -1))
+            except (TypeError, ValueError):
+                rank = -1
+            if not 0 <= rank < self.world_size:
+                # A phantom rank would count towards the ack quorum and let
+                # the owner free a range a real peer still reads.
+                logger.warning(
+                    "SharedEmbeddingArena: ignoring ACK with rank=%s (rid=%s)",
+                    rank,
+                    rid,
+                )
+                return
             self._record_peer_ack(
-                int(msg.get("rank", -1)),
+                rank,
                 [(rid, bool(msg.get("safe_reuse")))],
                 [rid] if msg.get("drain_unknown") else [],
             )
@@ -395,6 +416,19 @@ class SharedEmbeddingArena:
                 exc_info=True,
             )
             safe_reuse = False
+            # release() also queued a copy for the tick fallback with the
+            # original safe_reuse. Rewrite it too: if that copy reached the
+            # owner first and completed the ack set, the owner would reuse
+            # the range before the downgraded control ack arrived.
+            with self._lock:
+                self._ack_waiters = [
+                    (rid_, event_, (False if rid_ == rid else safe))
+                    for rid_, event_, safe in self._ack_waiters
+                ]
+                self._acks_ready = [
+                    (rid_, (False if rid_ == rid else safe))
+                    for rid_, safe in self._acks_ready
+                ]
         self._ctl_send_ack(rid, safe_reuse, drain_unknown)
 
     def _note_alloc_wait(self, seconds: float) -> None:
@@ -736,6 +770,21 @@ class SharedEmbeddingArena:
                         self._acks_seen_at.pop(rid, None)
                         if len(self._acks_seen) <= _STATE_KEEP:
                             break
+                # The owner seeds _pending_since for rids a peer advertised
+                # too. If that peer times out and stops advertising before
+                # the owner allocated or failed the rid, nothing revisits the
+                # entry: drop clocks older than the alloc timeout whose rid
+                # has no local state left.
+                timeout = envs.SGLANG_EMBEDDING_POOL_ALLOC_TIMEOUT_S.get()
+                for rid, started in list(self._pending_since.items()):
+                    if (
+                        now - started > timeout
+                        and rid not in self._requests
+                        and rid not in self._assigned
+                        and rid not in self._publish
+                        and rid not in self._slots
+                    ):
+                        self._pending_since.pop(rid, None)
             # Marks whose slot is already gone (TTL, abort) would otherwise
             # accumulate for the life of the process.
             if len(self._drain_unknown) > _STATE_KEEP:
@@ -960,6 +1009,10 @@ class SharedEmbeddingArena:
     def _free_slot_locked(
         self, slot: _Slot, reusable: bool = True, quarantine: bool = True
     ) -> None:
+        # Tombstone the rid on the owner as well: a late FAILED/ASSIGNED for
+        # an already-freed request must not be relayed to the peers (peers
+        # tombstone on receipt, the owner had no equivalent record).
+        self._note_freed_seen_locked(slot.rid)
         self._slots.pop(slot.rid, None)
         self._data_ready.discard(slot.rid)
         self._assigned.pop(slot.rid, None)

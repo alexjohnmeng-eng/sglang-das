@@ -83,6 +83,14 @@ def _bare_arena(**overrides) -> SharedEmbeddingArena:
     arena._force_frees = 0
     arena._abandoned_bytes = 0
     arena._immediate_frees = 0
+    # PROFILE=1 exercises these counters; without them the suite crashes
+    # under that env even though it is exactly the path being tested.
+    arena._alloc_wait_sum = 0.0
+    arena._alloc_wait_max = 0.0
+    arena._alloc_wait_n = 0
+    arena._ready_wait_sum = 0.0
+    arena._ready_wait_max = 0.0
+    arena._ready_wait_n = 0
     arena._tick_calls = 0
     arena._drain_unknown = set()
     arena._unsafe_acks = []
@@ -989,3 +997,112 @@ def test_freed_tombstone_is_bounded():
     # Oldest tombstones were evicted, newest retained.
     assert "r0" not in peer._freed_seen
     assert f"r{limit + 9}" in peer._freed_seen
+
+
+def test_failed_release_downgrades_the_tick_copy_too():
+    """The tick fallback ships its own ack copy; the fence failure must
+    downgrade that copy as well or the owner may reuse the range early."""
+
+    class _BadEvent:
+        def synchronize(self):
+            raise RuntimeError("fence failed")
+
+    peer = _bare_arena(is_owner=False, rank=1)
+    peer._ctl = _RecordingCtl()
+    waiter_event = object()
+    peer._ack_waiters = [("rid", waiter_event, True), ("other", waiter_event, True)]
+    peer._acks_ready = [("rid", True)]
+
+    peer._ctl_send_ack_after_fence(
+        "rid", _BadEvent(), safe_reuse=True, drain_unknown=False
+    )
+
+    assert ("rid", waiter_event, False) in peer._ack_waiters
+    # Other rids keep their original flag.
+    assert ("other", waiter_event, True) in peer._ack_waiters
+    assert ("rid", False) in [
+        (r, safe) for r, safe in peer._acks_ready if r == "rid"
+    ]
+
+
+def test_control_failed_populates_the_tick_delta():
+    """FAILED learned over the control channel must also reach the tick
+    payload, otherwise sibling peers only learn it via the 180s backstop."""
+    owner = _bare_arena(is_owner=True)
+    owner._apply_control_message(
+        {"state": "FAILED", "rid": "rid-f", "reason": "encoder refused"}
+    )
+    assert owner._failed["rid-f"] == "encoder refused"
+    assert owner._failed_out["rid-f"] == "encoder refused"
+
+
+def test_ack_with_bad_rank_is_ignored():
+    owner = _bare_arena(is_owner=True, world_size=2)
+    owner._apply_control_message({"state": "ACK", "rid": "rid", "safe_reuse": True})
+    owner._apply_control_message(
+        {"state": "ACK", "rid": "rid", "rank": -1, "safe_reuse": True}
+    )
+    owner._apply_control_message(
+        {"state": "ACK", "rid": "rid", "rank": 7, "safe_reuse": True}
+    )
+    assert "rid" not in owner._acks_seen
+
+    owner._apply_control_message(
+        {"state": "ACK", "rid": "rid", "rank": 1, "safe_reuse": True}
+    )
+    assert owner._acks_seen["rid"] == {1}
+
+
+def test_arena_ctl_group_id_distinguishes_subgroups_and_stages():
+    from sglang.srt.disaggregation.encoder.receiver import _arena_ctl_group_id
+
+    assert _arena_ctl_group_id(8997, 0, 0) == _arena_ctl_group_id(8997, 0, 0)
+    assert _arena_ctl_group_id(8997, 0, 0) != _arena_ctl_group_id(8997, 1, 0)
+    assert _arena_ctl_group_id(8997, 1, 0) != _arena_ctl_group_id(8997, 1, 1)
+
+
+def test_request_slot_timeout_clears_the_pending_clock(monkeypatch):
+    monkeypatch.setattr(
+        sa.envs.SGLANG_EMBEDDING_POOL_ALLOC_TIMEOUT_S, "get", lambda: 0.05
+    )
+    arena = _bare_arena(is_owner=True, _free=[], _ctl=None)
+    assert arena.request_slot("rid-to", 4096) is None
+    assert "rid-to" not in arena._requests
+    assert "rid-to" not in arena._pending_since
+
+
+def test_owner_tombstones_freed_rids():
+    """A late FAILED for a freed rid must not be relayed to the peers."""
+    owner = _bare_arena(is_owner=True)
+    slot = _alloc(owner, "rid-done", 4096)
+    owner._free_slot_locked(slot)
+    assert "rid-done" in owner._freed_seen
+
+    owner._apply_control_message(
+        {"state": "FAILED", "rid": "rid-done", "reason": "late"}
+    )
+    assert "rid-done" not in owner._failed
+    assert "rid-done" not in owner._failed_out
+
+
+def test_prune_stops_the_pending_clock_leak():
+    """Owner clocks for peer-only rids must not outlive the alloc timeout."""
+    import time as _time
+
+    owner = _bare_arena(is_owner=True)
+    owner._pending_since = {
+        "ghost": _time.monotonic() - 10_000.0,
+        "live": _time.monotonic(),
+    }
+    owner._requests["live"] = object()
+    owner._prune_state()
+    assert "ghost" not in owner._pending_since
+    assert "live" in owner._pending_since
+
+
+def test_ack_with_null_rank_is_ignored():
+    owner = _bare_arena(is_owner=True, world_size=2)
+    owner._apply_control_message(
+        {"state": "ACK", "rid": "rid", "rank": None, "safe_reuse": True}
+    )
+    assert "rid" not in owner._acks_seen
