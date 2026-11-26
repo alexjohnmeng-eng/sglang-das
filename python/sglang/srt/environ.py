@@ -1787,9 +1787,10 @@ class Envs:
     # many in-flight requests (the request queues, then fails after the alloc
     # timeout) instead of letting the encoder encode into a full arena.
     SGLANG_EMBEDDING_POOL_MAX_INFLIGHT = EnvInt(0)
-    # Out-of-band arena control plane over Unix domain sockets (assignment /
-    # DATA_READY / FAILED / FREED / ack). tick() stays as the fallback; set 0
-    # to force the collective-only behaviour.
+    # Out-of-band arena control plane over ZMQ ipc (ROUTER on the owner,
+    # DEALER on the peers; assignment / DATA_READY / FAILED / FREED / ack).
+    # tick() stays as the fallback; set 0 to force the collective-only
+    # behaviour.
     SGLANG_EMBEDDING_POOL_CTL_IPC = EnvBool(True)
     # A freed shared slot is only handed out again after this delay, so an
     # RDMA write that is still draining (or a laggard reader) cannot land in
@@ -1800,7 +1801,10 @@ class Envs:
     # process group with the scheduler's own collectives, so a rank-local time
     # gate would let one rank issue all_gather while another issues broadcast
     # and desynchronise the group. tick() runs once per scheduler iteration on
-    # every rank, so a call counter keeps them in lockstep. 1 = every iteration.
+    # every rank, so a call counter keeps them in lockstep. 0 and 1 both mean
+    # "every iteration" on this branch: 0 only disables the collective on the
+    # no-tick variant (feat/epd-arena-no-tick), where the control channel
+    # carries everything.
     SGLANG_EMBEDDING_POOL_TICK_EVERY = EnvInt(1)
     # A /send failure that cannot prove the encoder stopped writing (timeout or
     # dropped connection) permanently abandons that slot range instead of

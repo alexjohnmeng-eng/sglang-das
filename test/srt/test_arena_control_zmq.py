@@ -5,6 +5,7 @@ import threading
 import time
 
 import pytest
+import zmq
 
 from sglang.srt.disaggregation.encoder import arena_control
 from sglang.srt.disaggregation.encoder.arena_control import ArenaControlChannel
@@ -140,3 +141,62 @@ def test_send_after_stop_is_dropped():
     channel = _make(0, 2, gid, [])
     channel.stop()
     channel.send(1, {"state": "READY", "rid": "r1"})  # must not raise
+
+
+class _FakeSendSock:
+    """send_multipart stand-in: fails for configured peer routing ids."""
+
+    def __init__(self, failing_ranks):
+        self.failing = {f"rank{rank}".encode() for rank in failing_ranks}
+        self.sent = []
+
+    def send_multipart(self, frames, flags=0):
+        if frames[0] in self.failing:
+            raise zmq.ZMQError(zmq.EHOSTUNREACH)
+        self.sent.append(frames)
+
+
+def _offline_owner(world_size=3):
+    channel = ArenaControlChannel(
+        rank=0, world_size=world_size, group_id="hol", apply_fn=lambda msg: None
+    )
+    return channel
+
+
+def test_unreachable_peer_does_not_block_other_peers():
+    channel = _offline_owner()
+    try:
+        channel.send(1, {"state": "READY", "rid": "to1"})
+        channel.send(2, {"state": "READY", "rid": "to2"})
+        sock = _FakeSendSock(failing_ranks=[1])
+        channel._drain_outbound(sock)
+        # rank 2 got its message even though rank 1 failed first in the loop.
+        delivered = [frames for frames in sock.sent]
+        assert [f[0] for f in delivered] == [b"rank2"]
+        assert len(channel._outq[1]) == 1
+        assert not channel._outq[2]
+        assert channel._retry_after[1] > time.monotonic()
+    finally:
+        channel.stop()
+
+
+def test_permanently_unreachable_peer_is_dropped(monkeypatch):
+    monkeypatch.setattr(arena_control, "_PEER_STALE_S", 60.0)
+    channel = _offline_owner()
+    try:
+        channel.send(1, {"state": "READY", "rid": "a"})
+        channel.send(2, {"state": "READY", "rid": "b"})
+        sock = _FakeSendSock(failing_ranks=[1])
+        channel._drain_outbound(sock)  # records unreachable_since
+        assert 1 in channel._outq and channel._outq[1]
+        # Pretend the peer has been unreachable for longer than the limit and
+        # let the next attempt notice it.
+        channel._unreachable_since[1] = time.monotonic() - 120.0
+        channel._retry_after[1] = 0.0  # skip the backoff window
+        channel._drain_outbound(sock)  # stale -> drop rank 1's backlog
+        assert 1 not in channel._outq or not channel._outq[1]
+        assert not channel._outq[2]
+        assert 1 not in channel._unreachable_since
+        assert 1 not in channel._retry_after
+    finally:
+        channel.stop()

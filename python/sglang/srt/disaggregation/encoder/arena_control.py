@@ -44,7 +44,7 @@ import socket
 import threading
 import time
 from collections import deque
-from typing import Callable, Deque, Optional, Tuple
+from typing import Callable, Deque, Dict, Optional
 
 import zmq
 
@@ -58,6 +58,7 @@ _HWM = 1000
 _RETRY_BACKOFF_MAX_S = 1.0
 _BACKOFF_STEP_S = 0.2
 _SEND_RETRY_LOG_AT = 5
+_PEER_STALE_S = 60.0
 
 
 class ArenaControlChannel:
@@ -87,8 +88,14 @@ class ArenaControlChannel:
         self._ipc_path = f"{self._ctl_dir}/owner.ipc"
         self._endpoint = f"ipc://{self._ipc_path}"
         self._identity = f"rank{rank}".encode()
-        self._outq: Deque[Tuple[int, dict]] = deque()
+        # Per-peer outbound queues: one unreachable peer must not block the
+        # messages queued for the others. The poller drains them round-robin.
+        self._outq: Dict[int, Deque[dict]] = {}
         self._outq_lock = threading.Lock()
+        self._rr_cursor = 0
+        self._send_attempts: Dict[int, int] = {}
+        self._retry_after: Dict[int, float] = {}
+        self._unreachable_since: Dict[int, float] = {}
         # Self-pipe: send() writes one byte so the poller wakes immediately
         # instead of waiting out the poll timeout. Without it every control
         # message (and its ack) would sit in the queue for up to
@@ -101,8 +108,6 @@ class ArenaControlChannel:
             target=self._run, daemon=True, name=f"arena-ctl-r{rank}"
         )
         self._ctx: Optional[zmq.Context] = None
-        self._send_attempts = 0
-        self._retry_after = 0.0
         self._last_inbound = 0.0
         self._hb_warned = False
 
@@ -131,7 +136,8 @@ class ArenaControlChannel:
             self._wake_w.send(b"\x00")
         except OSError:
             pass
-        self._poller.join(timeout=2.0)
+        if self._poller.is_alive():
+            self._poller.join(timeout=2.0)
         for sock in (self._wake_r, self._wake_w):
             try:
                 sock.close()
@@ -163,7 +169,7 @@ class ArenaControlChannel:
         if self._stopped.is_set():
             return
         with self._outq_lock:
-            self._outq.append((rank, msg))
+            self._outq.setdefault(rank, deque()).append(msg)
         try:
             self._wake_w.send(b"\x00")
         except OSError:
@@ -208,8 +214,15 @@ class ArenaControlChannel:
         try:
             while not self._stopped.is_set():
                 timeout = _POLL_MS
-                if self._outq:
-                    remaining_ms = (self._retry_after - time.monotonic()) * 1000.0
+                now = time.monotonic()
+                with self._outq_lock:
+                    deadlines = [
+                        self._retry_after.get(peer, 0.0)
+                        for peer, queue in self._outq.items()
+                        if queue
+                    ]
+                if deadlines:
+                    remaining_ms = (min(deadlines) - now) * 1000.0
                     timeout = min(timeout, max(1, int(remaining_ms) + 1))
                 events = dict(poller.poll(timeout))
                 if events.get(wake_fd) == zmq.POLLIN:
@@ -241,36 +254,68 @@ class ArenaControlChannel:
                 return
 
     def _drain_outbound(self, sock: "zmq.Socket") -> None:
-        if self._outq and time.monotonic() < self._retry_after:
+        now = time.monotonic()
+        with self._outq_lock:
+            ready = sorted(
+                peer
+                for peer, queue in self._outq.items()
+                if queue and now >= self._retry_after.get(peer, 0.0)
+            )
+        if not ready:
             return
-        while self._outq:
+        # Round-robin so a peer with a long backlog cannot starve the others.
+        start = self._rr_cursor % len(ready)
+        order = ready[start:] + ready[:start]
+        self._rr_cursor += 1
+        for peer in order:
             with self._outq_lock:
-                if not self._outq:
-                    return
-                peer, msg = self._outq.popleft()
+                queue = self._outq.get(peer)
+                if not queue:
+                    continue
+                msg = queue.popleft()
             payload = json.dumps(msg).encode()
             frames = [f"rank{peer}".encode(), payload] if self.is_owner else [payload]
             try:
                 sock.send_multipart(frames, flags=zmq.DONTWAIT)
-                self._send_attempts = 0
             except zmq.ZMQError as error:
-                # Not connected (ROUTER_MANDATORY) or HWM full: put it back
-                # and back off; the message stays at the head of the queue.
+                # Not connected (ROUTER_MANDATORY) or HWM full: put the
+                # message back at the head of this peer's queue and back off
+                # for that peer only; the others keep flowing.
                 with self._outq_lock:
-                    self._outq.appendleft((peer, msg))
-                self._send_attempts += 1
-                delay = min(
-                    self._send_attempts * _BACKOFF_STEP_S, _RETRY_BACKOFF_MAX_S
-                )
-                self._retry_after = time.monotonic() + delay
-                if self._send_attempts == _SEND_RETRY_LOG_AT:
+                    self._outq.setdefault(peer, deque()).appendleft(msg)
+                attempts = self._send_attempts.get(peer, 0) + 1
+                self._send_attempts[peer] = attempts
+                delay = min(attempts * _BACKOFF_STEP_S, _RETRY_BACKOFF_MAX_S)
+                self._retry_after[peer] = time.monotonic() + delay
+                first_seen = self._unreachable_since.setdefault(peer, time.monotonic())
+                if attempts == _SEND_RETRY_LOG_AT:
                     logger.warning(
                         "Arena control: send to rank=%d retrying (%s): errno=%s",
                         peer,
                         msg.get("state"),
                         error.errno,
                     )
-                return
+                if time.monotonic() - first_seen > _PEER_STALE_S:
+                    # A peer that has been unreachable this long is treated as
+                    # dead: drop its backlog instead of retrying forever. The
+                    # arena's TTL/alloc/ready backstops cover the requests.
+                    with self._outq_lock:
+                        dropped = len(self._outq.pop(peer, ()))
+                    self._send_attempts.pop(peer, None)
+                    self._retry_after.pop(peer, None)
+                    self._unreachable_since.pop(peer, None)
+                    logger.error(
+                        "Arena control: rank=%d unreachable for %.0fs; "
+                        "dropped %d queued control messages",
+                        peer,
+                        time.monotonic() - first_seen,
+                        dropped,
+                    )
+                continue
+            # Delivered: clear this peer's backoff state.
+            self._send_attempts.pop(peer, None)
+            self._retry_after.pop(peer, None)
+            self._unreachable_since.pop(peer, None)
 
     def _drain_inbound(self, sock: "zmq.Socket") -> None:
         while True:

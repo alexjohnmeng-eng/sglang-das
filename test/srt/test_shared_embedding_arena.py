@@ -87,6 +87,8 @@ def _bare_arena(**overrides) -> SharedEmbeddingArena:
     arena._drain_unknown = set()
     arena._unsafe_acks = []
     arena._reuse_unsafe = set()
+    arena._freed_seen = set()
+    arena._freed_seen_order = []
     arena._tick_ms_sum = 0.0
     arena._tick_ms_max = 0.0
     arena._tick_ms_n = 0
@@ -893,3 +895,97 @@ def test_control_channel_failure_notification():
             owner._ctl.stop()
         if peer._ctl is not None:
             peer._ctl.stop()
+
+
+# ------------------------------------------------------ control routing ----
+class _RecordingCtl:
+    def __init__(self):
+        self.broadcasts = []
+        self.sends = []
+
+    def broadcast(self, msg):
+        self.broadcasts.append(msg)
+
+    def send(self, rank, msg):
+        self.sends.append((rank, msg))
+
+
+def test_peer_ack_goes_only_to_the_owner():
+    """A peer release must cost one frame, not world_size-1 to the owner."""
+    peer = _bare_arena(is_owner=False, rank=1)
+    peer._ctl = _RecordingCtl()
+    peer._ctl_publish("ACK", "rid", rank=1, safe_reuse=True)
+    assert peer._ctl.broadcasts == []
+    assert peer._ctl.sends == [
+        (0, {"state": "ACK", "rid": "rid", "rank": 1, "safe_reuse": True})
+    ]
+
+    owner = _bare_arena(is_owner=True)
+    owner._ctl = _RecordingCtl()
+    owner._ctl_publish("ACK", "rid", rank=0, safe_reuse=True)
+    # The owner records its own release locally; nothing goes on the wire.
+    assert owner._ctl.broadcasts == []
+    assert owner._ctl.sends == []
+
+
+def test_owner_state_changes_still_broadcast():
+    owner = _bare_arena(is_owner=True)
+    owner._ctl = _RecordingCtl()
+    owner._ctl_publish("READY", "rid")
+    assert owner._ctl.sends == []
+    assert owner._ctl.broadcasts == [{"state": "READY", "rid": "rid"}]
+
+    peer = _bare_arena(is_owner=False, rank=1)
+    peer._ctl = _RecordingCtl()
+    peer._ctl_publish("FAILED", "rid", reason="boom")
+    assert peer._ctl.broadcasts == []
+    assert peer._ctl.sends == [
+        (0, {"state": "FAILED", "rid": "rid", "reason": "boom"})
+    ]
+
+
+def test_failed_release_fence_forces_unsafe_reuse():
+    """A fence exception must downgrade the ack to safe_reuse=False."""
+
+    class _BadEvent:
+        def synchronize(self):
+            raise RuntimeError("fence failed")
+
+    peer = _bare_arena(is_owner=False, rank=1)
+    peer._ctl = _RecordingCtl()
+    peer._ctl_send_ack_after_fence(
+        "rid", _BadEvent(), safe_reuse=True, drain_unknown=False
+    )
+    acks = [msg for _, msg in peer._ctl.sends if msg["state"] == "ACK"]
+    assert len(acks) == 1
+    assert acks[0]["safe_reuse"] is False
+
+
+def test_late_assign_or_ready_after_freed_is_ignored():
+    """The other transport must not resurrect a rid that is already freed."""
+    peer = _bare_arena(is_owner=False, rank=1)
+    peer._apply_control_message({"state": "FREED", "rid": "r1"})
+    assert "r1" in peer._freed_seen
+
+    peer._apply_control_message(
+        {"state": "ASSIGNED", "rid": "r1", "offset": 0, "nbytes": 4096}
+    )
+    assert "r1" not in peer._assigned
+
+    peer._apply_control_message({"state": "READY", "rid": "r1"})
+    assert "r1" not in peer._data_ready
+
+    peer._apply_control_message({"state": "FAILED", "rid": "r1"})
+    assert "r1" not in peer._failed
+
+
+def test_freed_tombstone_is_bounded():
+    peer = _bare_arena(is_owner=False, rank=1)
+    limit = sa._FREED_SEEN_MAX
+    for index in range(limit + 10):
+        peer._apply_control_message({"state": "FREED", "rid": f"r{index}"})
+    assert len(peer._freed_seen) == limit
+    assert len(peer._freed_seen_order) == limit
+    # Oldest tombstones were evicted, newest retained.
+    assert "r0" not in peer._freed_seen
+    assert f"r{limit + 9}" in peer._freed_seen

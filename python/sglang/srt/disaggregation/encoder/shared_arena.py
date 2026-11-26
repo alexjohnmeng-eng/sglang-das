@@ -51,6 +51,9 @@ _ALIGN = 256
 # Request-state dicts keep the recent past for diagnostics; older entries are
 # dropped so a long-running server does not grow without bound.
 _STATE_KEEP = 4096
+# Freed-rid tombstones only need to outlive cross-transport reordering, which
+# is bounded by one scheduler iteration; a bounded FIFO is enough.
+_FREED_SEEN_MAX = 8192
 
 
 @dataclass
@@ -180,6 +183,13 @@ class SharedEmbeddingArena:
         # rids whose /send died without proof that the encoder stopped writing
         # (owner frees those slots permanently instead of recycling them)
         self._drain_unknown: Set[str] = set()
+        # rids already freed on this rank (via the control channel or tick).
+        # A late ASSIGNED/READY arriving over the other transport would
+        # otherwise resurrect state for a request that is already gone; rids
+        # are never reused, so ignoring them after FREED is always safe.
+        # Bounded FIFO so days of traffic cannot grow it without limit.
+        self._freed_seen: Set[str] = set()
+        self._freed_seen_order: List[str] = []
         # rids at least one rank released without a safe-reuse proof; those
         # still go through the reuse-delay quarantine
         self._reuse_unsafe: Set[str] = set()
@@ -300,10 +310,17 @@ class SharedEmbeddingArena:
         if self._ctl is None:
             return
         msg = {"state": state, "rid": rid, **fields}
-        if self.is_owner or state == "ACK":
+        if state == "ACK":
+            # Only the owner consumes acks. A peer's release is one message to
+            # the owner; the owner's own release is recorded locally by
+            # _ctl_send_ack and never goes on the wire (peers ignore acks).
+            if not self.is_owner:
+                self._ctl.send(0, msg)  # the owner is rank 0 in the arena group
+            return
+        if self.is_owner:
             self._ctl.broadcast(msg)
         else:
-            self._ctl.send(0, msg)  # the owner is rank 0 in the arena group
+            self._ctl.send(0, msg)
 
     def _apply_control_message(self, msg: dict) -> None:
         state = msg.get("state")
@@ -312,11 +329,15 @@ class SharedEmbeddingArena:
             self._adopt(rid, (int(msg["offset"]), int(msg["nbytes"])))
         elif state == "READY":
             with self._lock:
+                if rid in self._freed_seen:
+                    return  # a late copy of a state freed over the other path
                 if rid not in self._data_ready:
                     self._data_ready.add(rid)
                 self._signal_waiters_locked(rid)
         elif state == "FAILED":
             with self._lock:
+                if rid in self._freed_seen:
+                    return
                 if rid not in self._failed:
                     self._failed[rid] = msg.get("reason") or "shared arena failure"
                 self._signal_waiters_locked(rid)
@@ -327,6 +348,7 @@ class SharedEmbeddingArena:
                 self._failed.pop(rid, None)
                 self._requests.pop(rid, None)
                 self._wait_events.pop(rid, None)
+                self._note_freed_seen_locked(rid)
         elif state == "ACK":
             # Owner side only: fold the peer's ack and reap immediately.
             # _record_peer_ack/_owner_reap take the arena lock themselves.
@@ -363,7 +385,16 @@ class SharedEmbeddingArena:
         try:
             ready_event.synchronize()
         except Exception:
-            pass
+            # Without the fence there is no proof the readers finished, so the
+            # owner must not hand the range straight to the next request; the
+            # unsafe path sends safe_reuse=False and takes the quarantine.
+            logger.warning(
+                "SharedEmbeddingArena: release fence failed for rid=%s; "
+                "sending safe_reuse=False",
+                rid,
+                exc_info=True,
+            )
+            safe_reuse = False
         self._ctl_send_ack(rid, safe_reuse, drain_unknown)
 
     def _note_alloc_wait(self, seconds: float) -> None:
@@ -617,10 +648,14 @@ class SharedEmbeddingArena:
         if states is not None and not self.is_owner:
             with self._lock:
                 for rid in states["ready"]:
+                    if rid in self._freed_seen:
+                        continue
                     if rid not in self._data_ready:
                         self._data_ready.add(rid)
                     self._signal_waiters_locked(rid)
                 for rid, reason in states["failed"].items():
+                    if rid in self._freed_seen:
+                        continue
                     if rid not in self._failed:
                         self._failed[rid] = reason
                     self._signal_waiters_locked(rid)
@@ -629,6 +664,7 @@ class SharedEmbeddingArena:
                     self._failed.pop(rid, None)
                     self._assigned.pop(rid, None)
                     self._wait_events.pop(rid, None)
+                    self._note_freed_seen_locked(rid)
 
         if self.is_owner:
             self._owner_allocate(all_reqs)
@@ -750,10 +786,20 @@ class SharedEmbeddingArena:
 
     def _adopt(self, rid: str, assignment: Tuple[int, int]) -> None:
         with self._lock:
+            if rid in self._freed_seen:
+                return  # late copy of an assignment for an already-freed rid
             self._assigned[rid] = assignment
             req = self._requests.get(rid)
             if req is not None:
                 req.resolve(*assignment)
+
+    def _note_freed_seen_locked(self, rid: str) -> None:
+        if rid in self._freed_seen:
+            return
+        self._freed_seen.add(rid)
+        self._freed_seen_order.append(rid)
+        while len(self._freed_seen_order) > _FREED_SEEN_MAX:
+            self._freed_seen.discard(self._freed_seen_order.pop(0))
 
     def _owner_allocate(self, reqs: List[Tuple[str, int]]) -> None:
         max_inflight = envs.SGLANG_EMBEDDING_POOL_MAX_INFLIGHT.get()
