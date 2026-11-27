@@ -558,6 +558,13 @@ class TpModelWorker(BaseTpWorker):
         max_req_input_len = max_req_len - 5
         if self.dllm_algorithm is not None:
             max_req_input_len -= self.dllm_algorithm.block_size
+        # A speculative verify step can commit up to a full set of draft tokens
+        # beyond the caller's max_new_tokens, so the sequence can advance past
+        # max_req_len. The RoPE frequency table only has context_len entries,
+        # and the fused K-norm/RoPE KV-store kernel indexes it by position, so
+        # reserve the draft width here; otherwise a request that lands exactly
+        # on the context boundary VM-faults in that kernel.
+        max_req_input_len -= int(get_spec().speculative_num_draft_tokens or 0)
         return (
             self.model_runner.logical_max_total_num_tokens,
             get_schedule().max_prefill_tokens,

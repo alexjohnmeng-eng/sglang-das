@@ -1159,10 +1159,18 @@ async def send_staged_embedding(
             embedding_port=request["embedding_port"],
             session_id=request["session_id"],
             buffer_address=request["buffer_address"],
+            # A sibling rank of a shared embedding arena only wants the ack.
+            meta_only=bool(request.get("meta_only")),
         )
         if not sent:
             return False
 
+        if sent is server_module.SEND_ALREADY_COMPLETED:
+            # The request was released after this exact destination had
+            # already received its bytes (the response was lost). Counting it
+            # again would recreate _rid_to_send_done, which the sweeper no
+            # longer tracks (its _pending_at was discarded).
+            return True
         receive_count = request.get("receive_count")
         if receive_count:
             destination_endpoint = NetworkAddress(

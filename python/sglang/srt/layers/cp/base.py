@@ -157,6 +157,17 @@ class ContextParallelStrategy(ABC):
             f"{self.name} strategy does not support local q indices"
         )
 
+    def row_keep_mask(self, rows: torch.Tensor) -> torch.Tensor:
+        """Which of these flat batch rows this rank keeps after sharding.
+
+        ``rows`` index the forward's flattened batch -- the same coordinate
+        ``shard_hidden_states`` slices. A strategy whose shard is cheap to
+        express overrides this so a host-resident embedding stages only its
+        own rows to the GPU; the default keeps everything (correct, merely
+        unoptimized).
+        """
+        return torch.ones_like(rows, dtype=torch.bool)
+
     def shard_per_request(
         self,
         extend_seqs_cpu: List[int],

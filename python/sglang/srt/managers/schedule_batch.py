@@ -398,6 +398,11 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     precomputed_embeddings: Optional[MultimodalDataValue] = None
     # Keep precomputed_embeddings on GPU after use (EPD pool/GPU receive path)
     keep_device_embedding: bool = False
+    # True only when precomputed_embeddings is a view of the cross-process
+    # shared host arena (EPD hsa_ipc). CP row filtering is valid only here: a
+    # per-rank GPU pool already holds every row on every rank, and an ordinary
+    # CPU fallback tensor (ZMQ, no pool) is not sharded per rank either.
+    is_shared_host_embedding: bool = False
 
     # Processor-owned tensors/arrays/scalars/transports. msgspec rejects a
     # precise union with multiple custom types, but accepts Ext-decoded values

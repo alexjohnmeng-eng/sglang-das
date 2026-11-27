@@ -8,6 +8,7 @@ import mmap
 import os
 import pickle
 import sys
+import time
 from abc import abstractmethod
 from array import array
 from collections import defaultdict
@@ -59,6 +60,13 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
+
+# CP embedding staging hands over one row index per input_ids row; a mismatch
+# means an upstream rewrite changed the batch, so warn once and use identity.
+_row_index_mismatch_warned = False
+
+# (count, bytes, seconds) of persistent re-prefill copies, profile only.
+_clone_profile = [0, 0, 0.0]
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
@@ -420,15 +428,61 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         return pad_mm_tokens(input_ids, mm_inputs)
 
 
+# Aggregated stage timings for the shared-host staging path. PROFILE=1
+# records enqueue times (no extra synchronisation); PROFILE=2 blocks after the
+# H2D and the device copy so the numbers are real device times (it distorts
+# throughput, use it only for a breakdown run).
+_scatter_stats = {
+    "n": 0,
+    "setup_ms": 0.0,
+    "select_ms": 0.0,
+    "h2d_ms": 0.0,
+    "copy_ms": 0.0,
+    "h2d_mb": 0.0,
+}
+_SCATTER_LOG_EVERY = 200
+
+
+def _cp_keep_fn_for_items(keep_fn, items):
+    """CP row filtering applies only to shared-host-arena embeddings.
+
+    The arena holds one copy for the whole TP group, so each rank may stage
+    only its CP rows. A per-rank GPU pool already has every row on every rank
+    and an ordinary CPU fallback (ZMQ, no pool) is not sharded per rank; both
+    must keep the historical "stage every row" behaviour. ``src.is_cpu`` is
+    not a valid test for this: CPU tensors come from all three sources.
+    """
+    if keep_fn is None or not items:
+        return None
+    if all(item.is_shared_host_embedding for item in items):
+        return keep_fn
+    return None
+
+
 # masked_scatter_ materializes the expanded [num_tokens, hidden] bool mask plus
 # an int64 prefix-sum over it (~9 B per num_tokens x hidden element); the
 # cumsum-derived row indices keep the transients O(num_tokens) and sync-free.
 def _scatter_mm_embedding(
-    dest: torch.Tensor, mask: torch.Tensor, src: torch.Tensor
-) -> None:
-    # mask: [num_tokens, 1] bool; src: [num_mm_tokens, width] in sequence order.
-    src = src.to(dest.device, dest.dtype)
+    dest: torch.Tensor,
+    mask: torch.Tensor,
+    src: torch.Tensor,
+    row_index: Optional[torch.Tensor] = None,
+    keep_fn=None,
+) -> int:
+    """Place ``src`` rows into ``dest`` at the mask positions.
+
+    ``src`` may live in host memory (the shared embedding arena). With
+    ``keep_fn`` - the CP strategy's row predicate - only the rows this rank
+    keeps after sharding are gathered out of the host tensor and staged, so a
+    chunk's H2D traffic is the rank's own share rather than the whole chunk.
+    Rows the rank does not keep are left untouched here; the model's CP
+    sharding discards them later anyway.
+
+    Returns the number of rows copied (0 means this rank had nothing to read).
+    """
     num_src_rows = src.size(0)
+    profile = envs.SGLANG_EMBEDDING_POOL_PROFILE.get()
+    t_start = time.perf_counter() if profile else 0.0
     flat_mask = mask.view(-1)
     ranks = torch.cumsum(flat_mask, dim=0) - 1
     # False rows collapse into the discard slot num_src_rows; a mask/src
@@ -438,7 +492,116 @@ def _scatter_mm_embedding(
         (num_src_rows + 1,), dest.size(0), dtype=torch.long, device=dest.device
     )
     rows.scatter_(0, ranks, torch.arange(flat_mask.numel(), device=dest.device))
-    dest.index_copy_(0, rows[:num_src_rows], src)
+    dest_rows = rows[:num_src_rows]
+
+    staged = src
+    filter_rows = keep_fn is not None and src.is_cpu
+    if filter_rows:
+        if row_index is None or row_index.numel() != flat_mask.numel():
+            # A caller that rewrote input_ids without handing over matching
+            # row indices cannot be mapped to the global row numbers. An
+            # identity mapping would only be correct for a whole-batch call:
+            # inside a split batch it selects by sub-batch position, so the
+            # ranks' keep sets stop partitioning the rows and the missing row
+            # silently falls back to a text embedding. Disable filtering
+            # instead - every rank stages every row, which is correct.
+            global _row_index_mismatch_warned
+            if not _row_index_mismatch_warned:
+                _row_index_mismatch_warned = True
+                logger.warning(
+                    "CP row_index has %s entries for %d rows; disabling CP "
+                    "row filtering for this batch",
+                    None if row_index is None else row_index.numel(),
+                    flat_mask.numel(),
+                )
+            filter_rows = False
+        else:
+            # src rows follow mask order, so the same selection indexes both.
+            # One device->host transfer decides everything else: the row count
+            # and the gather indices are then computed on the CPU, without a
+            # second synchronisation for keep.sum().item().
+            keep_cpu = keep_fn(row_index[flat_mask]).cpu()
+            idx_cpu = keep_cpu.nonzero().flatten()
+            kept = int(idx_cpu.numel())
+            if kept == 0:
+                return 0
+            if kept == num_src_rows:
+                # Identity selection (e.g. a CP strategy whose predicate keeps
+                # every row): indexing and copying the whole chunk on the host
+                # would only add work.
+                filter_rows = False
+            elif (
+                envs.SGLANG_EMBEDDING_POOL_DEBUG_KEEP.get()
+                and torch.distributed.is_initialized()
+            ):
+                # Every rank keeps a disjoint slice of the same rows; a
+                # strategy change that breaks that would corrupt output.
+                total = torch.tensor([kept], dtype=torch.long, device=dest.device)
+                torch.distributed.all_reduce(total, op=torch.distributed.ReduceOp.SUM)
+                if int(total.item()) != num_src_rows:
+                    logger.error(
+                        "CP keep masks do not partition the multimodal rows: "
+                        "ranks kept %d of %d",
+                        int(total.item()),
+                        num_src_rows,
+                    )
+    t_stage = time.perf_counter()
+    select_s = 0.0
+    if filter_rows:
+        staged_cpu = src.index_select(0, idx_cpu)
+        select_s = time.perf_counter() - t_stage
+        dest_rows = dest_rows[keep_cpu.to(dest.device)]
+        # Blocking copy: the gathered buffer is pageable and short-lived.
+        t_h2d = time.perf_counter()
+        staged = staged_cpu.to(dest.device, dest.dtype)
+    else:
+        select_s = 0.0
+        t_h2d = time.perf_counter()
+        staged = src.to(dest.device, dest.dtype)
+        kept = num_src_rows
+    h2d_s = time.perf_counter() - t_h2d
+    if profile >= 2:
+        # Blocking device copy done: measure the real transfer time.
+        torch.cuda.synchronize(dest.device)
+        h2d_s = time.perf_counter() - t_h2d
+
+    t_copy = time.perf_counter()
+    dest.index_copy_(0, dest_rows, staged)
+    if profile >= 2:
+        torch.cuda.synchronize(dest.device)
+    copy_s = time.perf_counter() - t_copy
+    if profile:
+        row_bytes = src.size(1) * src.element_size() if src.dim() > 1 else 0
+        st = _scatter_stats
+        st["n"] += 1
+        st["setup_ms"] += (t_stage - t_start) * 1000.0
+        st["select_ms"] += select_s * 1000.0
+        st["h2d_ms"] += h2d_s * 1000.0
+        st["copy_ms"] += copy_s * 1000.0
+        st["h2d_mb"] += kept * row_bytes / (1024 * 1024)
+        if st["n"] % _SCATTER_LOG_EVERY == 0:
+            n = st["n"]
+            logger.info(
+                "[pool-profile] scatter-agg n=%d setup_ms=%.2f sel_ms=%.2f "
+                "h2d_ms=%.2f copy_ms=%.2f h2d_mb=%.1f deep=%s",
+                n,
+                st["setup_ms"] / n,
+                st["select_ms"] / n,
+                st["h2d_ms"] / n,
+                st["copy_ms"] / n,
+                st["h2d_mb"] / n,
+                profile >= 2,
+            )
+    if profile:
+        logger.info(
+            "[pool-profile] scatter src=%s rows=%d kept=%d h2d=%.1fMB total_ms=%.2f",
+            "host" if src.is_cpu else "device",
+            num_src_rows,
+            kept,
+            kept * row_bytes / (1024 * 1024),
+            (time.perf_counter() - t_start) * 1000.0,
+        )
+    return kept
 
 
 def embed_mm_inputs(
@@ -451,6 +614,8 @@ def embed_mm_inputs(
     data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
     use_deepstack: Dict[Modality, bool] = {},
+    row_index: Optional[torch.Tensor] = None,
+    keep_fn=None,
 ) -> Optional[torch.Tensor]:
     """
     Embed multimodal inputs and integrate them with text token embeddings.
@@ -462,6 +627,10 @@ def embed_mm_inputs(
         input_ids: Input token IDs tensor
         input_embedding: Embedding layer for text tokens
         placeholder_tokens: Token IDs for multimodal placeholders (uses pad_values if None)
+        row_index: Row of each ``input_ids`` entry in the forward's flattened
+            batch. Host-resident embeddings use it with ``keep_fn`` to stage
+            only this rank's CP shard.
+        keep_fn: CP row predicate ``rows -> BoolTensor``; None keeps every row.
 
     Returns:
         Combined embedding tensor with multimodal content integrated
@@ -478,6 +647,8 @@ def embed_mm_inputs(
 
     # deepstack_embeddings: per-modality
     modalities, embeddings, masks, deepstack_embeddings = [], [], [], []
+    # Per-modality CP gate: only shared host arena views may be row-filtered.
+    modality_keep_fns = []
 
     # 2. Get multimodal embedding separately
     # Try get mm embedding if any
@@ -544,6 +715,7 @@ def embed_mm_inputs(
             modalities += [modality]
             embeddings += [embedding]
             masks += [mask]
+            modality_keep_fns += [_cp_keep_fn_for_items(keep_fn, items)]
 
     # 3. Get input embeddings
     vocab_size = input_embedding.num_embeddings
@@ -571,15 +743,27 @@ def embed_mm_inputs(
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
     # 4. scatter embeddings into input embedding
-    for i, modality, embedding, mask in zip(
-        range(len(embeddings)), modalities, embeddings, masks
+    for i, modality, embedding, mask, item_keep_fn in zip(
+        range(len(embeddings)), modalities, embeddings, masks, modality_keep_fns
     ):
         if embedding is None or mask is None:
             continue
-        _scatter_mm_embedding(dest=input_embeds, mask=mask, src=embedding)
+        _scatter_mm_embedding(
+            dest=input_embeds,
+            mask=mask,
+            src=embedding,
+            row_index=row_index,
+            keep_fn=item_keep_fn,
+        )
         if use_deepstack.get(modality, None):
+            # Deepstack rows mirror the main embedding rows one-to-one, so the
+            # same CP keep selection keeps both tensors aligned.
             _scatter_mm_embedding(
-                dest=input_deepstack_embeds, mask=mask, src=deepstack_embeddings[i]
+                dest=input_deepstack_embeds,
+                mask=mask,
+                src=deepstack_embeddings[i],
+                row_index=row_index,
+                keep_fn=item_keep_fn,
             )
 
     return input_embeds, other_info
@@ -605,9 +789,16 @@ def release_consumed_pool_slots(
     Only items bound with slot leases are touched (see the receiver's
     ``_POOL_SLOT_LEASE_MODEL_TYPES``); every other item is left as is.
 
-    Consumed views are offloaded to CPU first, so a re-prefill (e.g. retraction)
-    still has its embeddings. The release carries an event recorded after this
-    batch's reads; the pool reuses the slot only once it completes.
+    Consumed views are detached from the pool before the slot is returned, so a
+    re-prefill (e.g. retraction) still has its embeddings:
+
+    * device pool: copy the view to CPU;
+    * pinned host arena: ``clone()`` it -- ``.to("cpu")`` on a host tensor is a
+      no-op that returns the same tensor, leaving the item aliasing pool
+      storage that the next request's RDMA write may overwrite.
+
+    The release carries an event recorded after this batch's reads; a host
+    arena reuses the slot only once every rank's event completed.
     """
     per_req = []
     for mm_inputs, prefix_len, seq_len in zip(
@@ -625,15 +816,52 @@ def release_consumed_pool_slots(
 
     stream = None
     offloaded = False
+    leases = {}
     for items, consumed in per_req:
         for item in items:
+            # Collected before the lease list is cleared below; all items of a
+            # request share one lease and one `consumed` verdict.
+            for lease in item.pool_slot_leases:
+                leases[id(lease)] = (lease, consumed)
             embedding = item.precomputed_embeddings
-            if not (isinstance(embedding, torch.Tensor) and embedding.is_cuda):
+            if not isinstance(embedding, torch.Tensor):
                 continue
-            stream = torch.cuda.current_stream(embedding.device)
+            if embedding.is_cuda:
+                stream = torch.cuda.current_stream(embedding.device)
+                if consumed:
+                    item.precomputed_embeddings = embedding.to(
+                        "cpu", non_blocking=True
+                    )
+                    offloaded = True
+            else:
+                # A host chunk that was staged this batch is read on the same
+                # stream; the event below fences the slot reuse behind it.
+                stream = torch.cuda.current_stream()
+                if consumed:
+                    t_clone = time.perf_counter()
+                    item.precomputed_embeddings = embedding.clone()
+                    if envs.SGLANG_EMBEDDING_POOL_PROFILE.get():
+                        # Aggregate: one line per item would dominate the very
+                        # path being measured under load.
+                        global _clone_profile
+                        _clone_profile[0] += 1
+                        _clone_profile[1] += (
+                            embedding.numel() * embedding.element_size()
+                        )
+                        _clone_profile[2] += time.perf_counter() - t_clone
+                        if _clone_profile[0] % 500 == 0:
+                            logger.info(
+                                "[pool-profile] re-prefill clone n=%d avg_ms=%.2f "
+                                "total_mb=%.1f",
+                                _clone_profile[0],
+                                _clone_profile[2] / _clone_profile[0] * 1000.0,
+                                _clone_profile[1] / (1024 * 1024),
+                            )
             if consumed:
-                item.precomputed_embeddings = embedding.to("cpu", non_blocking=True)
-                offloaded = True
+                # Released below; drop the lease so later chunks of the same
+                # request do not copy the embedding out a second time.
+                # (pool_slot_leases is a read-only property.)
+                item.attach_pool_slot_leases(())
 
     last_use = None
     if stream is not None:
@@ -644,13 +872,11 @@ def release_consumed_pool_slots(
                 mm_schedule.host_offload_event = torch.cuda.Event()
             mm_schedule.host_offload_event.record(stream)
 
-    for items, consumed in per_req:
-        leases = {id(lease): lease for item in items for lease in item.pool_slot_leases}
-        for lease in leases.values():
-            if consumed:
-                lease.release(last_use)
-            else:
-                lease.mark_used(last_use)
+    for lease, consumed in leases.values():
+        if consumed:
+            lease.release(last_use)
+        else:
+            lease.mark_used(last_use)
 
 
 def _embed_mm_inputs_with_split(
@@ -677,20 +903,36 @@ def _embed_mm_inputs_with_split(
         else:
             non_precomputed_req_indices.append(idx)
 
+    # CP row predicate: a host-resident embedding then stages only the rows
+    # this rank keeps. None when the batch is not running through CP.
+    from sglang.srt.layers.cp.utils import cp_row_keep_fn
+
+    keep_fn = cp_row_keep_fn(forward_batch)
+
     embed_kwargs = dict(
         multimodal_model=multimodal_model,
         input_embedding=input_embedding,
         data_embedding_func_mapping=data_embedding_func_mapping,
         placeholder_tokens=placeholder_tokens,
         use_deepstack=use_deepstack,
+        keep_fn=keep_fn,
     )
 
     if not precomputed_req_indices or not non_precomputed_req_indices:
+        # This call sees the whole batch, so an identity row index is the
+        # global row number the CP predicate expects. Without it the shared
+        # host staging would disable row filtering and every rank would H2D
+        # the entire chunk.
         return embed_mm_inputs(
             mm_inputs_list=mm_inputs_list,
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
             input_ids=input_ids,
+            row_index=(
+                torch.arange(input_ids.shape[0], device=input_ids.device)
+                if keep_fn is not None
+                else None
+            ),
             **embed_kwargs,
         )
 
@@ -729,12 +971,30 @@ def _embed_mm_inputs_with_split(
             for bi in group_batch_indices
         ]
         sub_input_ids = torch.cat(sub_slices)
+        # The CP shard slices the whole batch, so each sub-batch row must carry
+        # its row index in that whole batch, not its index within the group.
+        # Only the row-filtering path needs it.
+        sub_row_index = (
+            torch.cat(
+                [
+                    torch.arange(
+                        token_starts[bi],
+                        token_starts[bi] + all_seq_lens[bi],
+                        device=input_ids.device,
+                    )
+                    for bi in group_batch_indices
+                ]
+            )
+            if keep_fn is not None
+            else None
+        )
 
         sub_embeds, sub_info = embed_mm_inputs(
             mm_inputs_list=sub_mm_inputs,
             extend_prefix_lens=sub_prefix_lens,
             extend_seq_lens=sub_seq_lens,
             input_ids=sub_input_ids,
+            row_index=sub_row_index,
             **embed_kwargs,
         )
 
@@ -832,6 +1092,9 @@ def prepare_mm_inputs(
                         use_deepstack=use_deepstack,
                     )
                 else:
+                    from sglang.srt.layers.cp.utils import cp_row_keep_fn
+
+                    keep_fn = cp_row_keep_fn(forward_batch)
                     input_embeds, other_info = embed_mm_inputs(
                         mm_inputs_list=mm_inputs_list,
                         extend_prefix_lens=extend_prefix_lens,
@@ -842,6 +1105,14 @@ def prepare_mm_inputs(
                         data_embedding_func_mapping=data_embedding_funcs,
                         placeholder_tokens=placeholder_tokens,
                         use_deepstack=use_deepstack,
+                        row_index=(
+                            torch.arange(
+                                input_ids.shape[0], device=input_ids.device
+                            )
+                            if keep_fn is not None
+                            else None
+                        ),
+                        keep_fn=keep_fn,
                     )
 
             # add for qwen3_vl deepstack

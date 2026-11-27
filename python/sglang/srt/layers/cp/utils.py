@@ -190,6 +190,21 @@ def is_cp_active(forward_batch) -> bool:
 is_cp_v2_active = is_cp_active
 
 
+def cp_row_keep_fn(forward_batch):
+    """Row predicate for this forward's CP shard, or None when CP is idle.
+
+    ``embed_mm_inputs`` uses it to stage only the embedding rows this rank
+    will keep when the embedding lives in host memory -- every CP rank reads
+    a different, non-overlapping subset of the chunk.
+    """
+    if not is_cp_active(forward_batch):
+        return None
+    strategy = get_cp_strategy()
+    if strategy is None:
+        return None
+    return strategy.row_keep_mask
+
+
 def is_mla_cp_enabled() -> bool:
     """Return whether prefill CP is configured for an MLA attention backend."""
     return is_cp_enabled() and uses_mla_backend()
