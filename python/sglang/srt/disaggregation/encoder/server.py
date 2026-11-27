@@ -1788,6 +1788,14 @@ class MMEncoder:
     ) -> Optional[torch.Tensor]:
         """Resolve cache hits, compute misses, assemble output, and insert misses."""
         missing_indices, hit_indices = await self._lookup_global_cache(ctx)
+        if self.rank == 0:
+            logger.info(
+                "Global embedding cache: hit=%d miss=%d total=%d req=%s",
+                len(hit_indices),
+                len(missing_indices),
+                ctx.num_items,
+                ctx.req_id,
+            )
         hit_hashes, prefetch_failed = self._prefetch_global_cache_hits(ctx, hit_indices)
 
         new_slices = []
