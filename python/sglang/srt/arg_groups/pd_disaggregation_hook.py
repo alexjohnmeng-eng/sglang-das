@@ -317,6 +317,36 @@ def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
         )
 
 
+def _reject_multi_tokenizer_language_only(cfg: Any) -> None:
+    """Reject language-only + multi tokenizer workers.
+
+    The language-only tokenizer manager creates its own EncoderBootstrapServer
+    that encoders dynamically register with. Each tokenizer worker is a separate
+    process, so ``tokenizer_worker_num > 1`` makes every worker bind the same
+    ``--encoder-bootstrap-port``: only one wins the bind and each worker ends up
+    with an independent (forked) encoder registry, silently hiding encoders
+    registered with the others.
+    """
+    if cfg.language_only and cfg.tokenizer_worker_num > 1:
+        if cfg.encoder_urls:
+            # Static --encoder-urls keeps every worker's registry usable;
+            # only dynamic registrations land on the worker that won the
+            # bootstrap-port bind.
+            logger.warning(
+                "language-only prefill with %d tokenizer workers: dynamic "
+                "encoder registrations reach only the worker that bound "
+                "--encoder-bootstrap-port; static --encoder-urls still route. "
+                "Prefer --tokenizer-worker-num 1 for dynamic discovery.",
+                cfg.tokenizer_worker_num,
+            )
+            return
+        raise ValueError(
+            "language-only prefill with more than one tokenizer worker and no "
+            "static --encoder-urls would fork the EncoderBootstrapServer "
+            "registry; use --tokenizer-worker-num 1 or set --encoder-urls"
+        )
+
+
 def handle_encoder_disaggregation(server_args: Any):
     from sglang.srt.arg_groups.model_hook import handle_language_model_only
     from sglang.srt.arg_groups.validation_hook import validate_ib_devices
@@ -341,6 +371,8 @@ def handle_encoder_disaggregation(server_args: Any):
             "expected to register dynamically via the "
             "EncoderBootstrapServer."
         )
+
+    _reject_multi_tokenizer_language_only(cfg)
 
     # Validate IB devices when mooncake backend is used
     if (

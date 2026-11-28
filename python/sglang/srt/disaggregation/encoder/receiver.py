@@ -1,8 +1,10 @@
 import asyncio
 import hashlib
+import hmac
 import itertools
 import logging
 import random
+import socket
 import threading
 import time
 import uuid
@@ -11,9 +13,10 @@ from abc import ABC, abstractmethod
 from array import array
 from collections import OrderedDict, defaultdict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from enum import IntEnum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple
 
 import aiohttp
 import numpy as np
@@ -22,7 +25,7 @@ import uvicorn
 import zmq
 import zmq.asyncio
 from aiohttp import ClientSession, ClientTimeout
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import ORJSONResponse, Response
 from transformers import PretrainedConfig
 
@@ -135,6 +138,364 @@ def _mark_shared_host_embeddings(mm_inputs) -> None:
         item.is_shared_host_embedding = True
 
 
+# --------------------------------------------------------------------------- #
+# Dynamic encoder registry                                                     #
+# --------------------------------------------------------------------------- #
+
+
+def parse_allowed_prefixes(raw: Optional[str]) -> List[str]:
+    """Parse the comma-separated allowlist env value into URL prefixes."""
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _url_origin(url: str) -> Optional[Tuple[str, str, int]]:
+    """(scheme, host, port) for origin comparison; ``None`` if unparsable."""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit((url or "").strip())
+        if not parts.scheme or not parts.hostname:
+            return None
+        port = parts.port or (443 if parts.scheme.lower() == "https" else 80)
+        return (parts.scheme.lower(), parts.hostname.lower(), port)
+    except ValueError:
+        return None
+
+
+def url_allowed_by_prefixes(url: str, prefixes: List[str]) -> bool:
+    """Origin-boundary allowlist check.
+
+    String ``startswith`` would let ``http://10.0.0.1.attacker.example`` pass
+    a ``http://10.0.0.`` prefix.  Prefixes are therefore interpreted as full
+    origins (``scheme://host[:port]``) and compared on parsed (scheme, host,
+    port) tuples.
+    """
+    if not prefixes:
+        return True
+    origin = _url_origin(url)
+    if origin is None:
+        return False
+    for prefix in prefixes:
+        if _url_origin(prefix) == origin:
+            return True
+    return False
+
+
+def probe_paths(url: str, primary: str) -> List[str]:
+    """Ordered probe URLs: *primary* first, then ``/health`` as fallback.
+
+    ``primary`` may be given with or without a leading slash.  When it already
+    resolves to ``/health`` the list collapses to a single entry.
+    """
+    base = url.rstrip("/")
+    path = (primary or "/health").strip() or "/health"
+    if not path.startswith("/"):
+        path = "/" + path
+    primary_url = f"{base}{path}"
+    fallback_url = f"{base}/health"
+    if primary_url == fallback_url:
+        return [primary_url]
+    return [primary_url, fallback_url]
+
+
+async def probe_with_fallback(
+    session,
+    url: str,
+    primary: str,
+    on_fallback: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """Probe *url*, retrying ``/health`` once when *primary* answers 404.
+
+    A custom health path (e.g. ``/live``) may be configured globally while a
+    few encoders still run an older build that only exposes ``/health``.  The
+    fallback keeps those encoders discoverable; ``on_fallback`` is invoked on
+    each fallback so the server can decide whether to log it.
+    """
+    paths = probe_paths(url, primary)
+    for index, probe_url in enumerate(paths):
+        try:
+            async with session.get(probe_url) as response:
+                status = response.status
+        except Exception:
+            return False
+        if status == 200:
+            return True
+        if status == 404 and index + 1 < len(paths):
+            if on_fallback is not None:
+                on_fallback(url)
+            continue
+        return False
+    return False
+
+
+def is_authorized(authorization: Optional[str], token: str) -> bool:
+    """Validate an ``Authorization`` header against the shared bearer token.
+
+    An empty *token* disables auth (legacy behaviour).
+    """
+    if not token:
+        return True
+    if not authorization:
+        return False
+    return hmac.compare_digest(authorization, f"Bearer {token}")
+
+
+@dataclass(frozen=True)
+class RegisterResult:
+    """Outcome of one registration attempt (``reason`` is route-facing)."""
+
+    accepted: bool
+    reason: str = ""
+
+
+class EncoderRegistry:
+    """Thread-safe encoder URL registry with instance-generation tombstones.
+
+    State
+    -----
+    urls:
+        Ordered list of active encoder URLs.  The list may be shared by
+        reference with a co-located receiver, so it is mutated in place rather
+        than replaced.
+    instances:
+        ``url -> last accepted instance_id`` (``None`` when the encoder used
+        the legacy payload without an instance id).
+    tombstones:
+        ``url -> instance_id`` captured by :meth:`unregister`.  A heartbeat
+        from that exact generation is rejected so a retired encoder cannot
+        resurrect itself; any other (or missing/empty) id is a new generation
+        and clears the tombstone.
+    evicted:
+        ``url -> eviction timestamp`` for health-check eviction.  Evicted URLs
+        are absent from ``urls`` but still probed and may revive.
+    fail_counts:
+        Consecutive probe failures for active URLs.
+    """
+
+    def __init__(
+        self,
+        urls: Optional[List[str]] = None,
+        allowed_url_prefixes: Optional[List[str]] = None,
+        max_urls: int = 0,
+    ):
+        self._urls: List[str] = urls if urls is not None else []
+        self._instances: Dict[str, Optional[str]] = {}
+        self._tombstones: Dict[str, str] = {}
+        self._tombstone_order: List[str] = []
+        # Bound the tombstone bookkeeping: fleet rollouts mint new IPs, and an
+        # unbounded dict would grow for the life of the prefill process.
+        self._max_tombstones = 1024
+        self._evicted: Dict[str, float] = {}
+        self._fail_counts: Dict[str, int] = {}
+        self._allowed_prefixes = list(allowed_url_prefixes or [])
+        self._max_urls = int(max_urls or 0)
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------ #
+    # Registration                                                       #
+    # ------------------------------------------------------------------ #
+    def register(self, url: str, instance_id: Optional[str] = None) -> RegisterResult:
+        """Register *url* for *instance_id* (``None`` = legacy payload)."""
+        with self._lock:
+            return self._register_locked(url, instance_id)
+
+    def _register_locked(self, url: str, instance_id: Optional[str]) -> RegisterResult:
+        if not url_allowed_by_prefixes(url, self._allowed_prefixes):
+            logger.warning(
+                "Rejected encoder registration for %s: not in "
+                "SGLANG_ENCODER_BOOTSTRAP_ALLOWED_URL_PREFIXES",
+                url,
+            )
+            return RegisterResult(False, "url not allowed by prefix allowlist")
+
+        tombstone = self._tombstones.get(url)
+        if tombstone is not None:
+            # Only a non-empty id equal to the retired one is a stale
+            # heartbeat.  None/empty means "no generation", which the
+            # contract treats as a new generation.
+            if instance_id and instance_id == tombstone:
+                logger.warning(
+                    "Rejected stale heartbeat from retired encoder %s "
+                    "(instance %s)",
+                    url,
+                    instance_id,
+                )
+                return RegisterResult(False, "stale instance generation")
+            self._tombstones.pop(url, None)
+            if url in self._tombstone_order:
+                self._tombstone_order.remove(url)
+
+        if url in self._urls:
+            known_instance = self._instances.get(url)
+            if not instance_id or instance_id == known_instance:
+                # Idempotent repeat: accepted (it *is* registered) but leave
+                # health state alone.  A heartbeat must not mask a genuinely
+                # unhealthy encoder.
+                logger.debug("Encoder URL already registered: %s", url)
+                return RegisterResult(True, "already registered")
+            # Same URL, new generation: refresh liveness state.
+            self._instances[url] = instance_id
+            self._evicted.pop(url, None)
+            self._fail_counts.pop(url, None)
+            logger.info(
+                "Registered encoder URL %s (new instance %s)", url, instance_id
+            )
+            return RegisterResult(True, "")
+
+        if url in self._evicted:
+            known_instance = self._instances.get(url)
+            if not instance_id or instance_id == known_instance:
+                # Same generation as the evicted encoder: a heartbeat must
+                # never override health eviction.  Revival is driven by a
+                # successful probe, or by a new instance generation below.
+                logger.debug(
+                    "Ignoring heartbeat from health-evicted encoder %s "
+                    "(instance %r)",
+                    url,
+                    instance_id,
+                )
+                return RegisterResult(False, "evicted; waiting for health probe")
+            self._evicted.pop(url, None)
+
+        if self._max_urls > 0 and len(self._urls) >= self._max_urls:
+            logger.warning(
+                "Rejected encoder registration for %s: already at "
+                "SGLANG_ENCODER_BOOTSTRAP_MAX_URLS=%d",
+                url,
+                self._max_urls,
+            )
+            return RegisterResult(
+                False, f"max encoder URLs reached ({self._max_urls})"
+            )
+
+        # New URL, or an evicted one reviving: clear stale health state.
+        self._evicted.pop(url, None)
+        self._fail_counts.pop(url, None)
+        self._urls.append(url)
+        self._instances[url] = instance_id
+        logger.info("Registered encoder URL: %s (instance %r)", url, instance_id)
+        return RegisterResult(True, "")
+
+    def unregister(self, url: str) -> bool:
+        """Remove *url* and tombstone its current generation.
+
+        The tombstone stops a still-running retired encoder from reviving via
+        heartbeat.  Unknown instance ids are recorded as the empty string,
+        which the contract treats as "no generation" on the next register.
+        """
+        with self._lock:
+            known = (
+                url in self._urls
+                or url in self._evicted
+                or url in self._instances
+            )
+            removed = url in self._urls or url in self._evicted
+            if known:
+                instance = self._instances.pop(url, None)
+                self._tombstones[url] = instance or ""
+                if url in self._tombstone_order:
+                    self._tombstone_order.remove(url)
+                self._tombstone_order.append(url)
+                self._prune_tombstones_locked()
+            if url in self._urls:
+                self._urls.remove(url)
+            self._evicted.pop(url, None)
+            self._fail_counts.pop(url, None)
+            if removed:
+                logger.info(
+                    "Unregistered encoder URL: %s (instance %r)",
+                    url,
+                    self._tombstones.get(url, ""),
+                )
+            return removed
+
+    def _prune_tombstones_locked(self) -> None:
+        """Cap the tombstone bookkeeping (oldest generation evicted first)."""
+        while (
+            len(self._tombstones) > self._max_tombstones
+            and self._tombstone_order
+        ):
+            oldest = self._tombstone_order.pop(0)
+            self._tombstones.pop(oldest, None)
+
+    # ------------------------------------------------------------------ #
+    # Read-only snapshots                                                #
+    # ------------------------------------------------------------------ #
+    def list_urls(self) -> List[str]:
+        with self._lock:
+            return list(self._urls)
+
+    def instance_id(self, url: str) -> Optional[str]:
+        with self._lock:
+            return self._instances.get(url)
+
+    def tombstone(self, url: str) -> Optional[str]:
+        with self._lock:
+            return self._tombstones.get(url)
+
+    def fail_count(self, url: str) -> int:
+        with self._lock:
+            return self._fail_counts.get(url, 0)
+
+    def is_evicted(self, url: str) -> bool:
+        with self._lock:
+            return url in self._evicted
+
+    # ------------------------------------------------------------------ #
+    # Health-check state (kept here so one lock guards all mutations)    #
+    # ------------------------------------------------------------------ #
+    def prepare_health_round(
+        self, now: float, evicted_ttl: float
+    ) -> Tuple[List[str], List[str]]:
+        """Expire stale evictions and return ``(expired, candidates)``."""
+        with self._lock:
+            expired: List[str] = []
+            if evicted_ttl > 0:
+                expired = [
+                    url
+                    for url, ts in self._evicted.items()
+                    if now - ts >= evicted_ttl
+                ]
+                for url in expired:
+                    self._evicted.pop(url, None)
+                    self._fail_counts.pop(url, None)
+            candidates = list(dict.fromkeys(self._urls + list(self._evicted)))
+            return expired, candidates
+
+    def apply_health_results(
+        self,
+        results: List[Tuple[str, object]],
+        now: float,
+        fail_threshold: int,
+    ) -> Tuple[List[str], List[str]]:
+        """Fold probe results back in; return ``(evicted, revived)``."""
+        evicted: List[str] = []
+        revived: List[str] = []
+        with self._lock:
+            for url, ok in results:
+                if ok is True:
+                    self._fail_counts.pop(url, None)
+                    if url in self._evicted:
+                        self._evicted.pop(url, None)
+                        if url not in self._urls:
+                            self._urls.append(url)
+                        revived.append(url)
+                    continue
+                if url in self._evicted:
+                    continue
+                count = self._fail_counts.get(url, 0) + 1
+                self._fail_counts[url] = count
+                if count >= fail_threshold:
+                    if url in self._urls:
+                        self._urls.remove(url)
+                    self._evicted[url] = now
+                    self._fail_counts.pop(url, None)
+                    evicted.append(url)
+            return evicted, revived
+
+
 class EncoderBootstrapServer:
     """Lightweight bootstrap server for dynamic encoder discovery.
 
@@ -145,10 +506,15 @@ class EncoderBootstrapServer:
     The set of registered URLs is exposed as the ``urls`` list passed in at
     construction time.  Callers that want to observe registrations without
     going through HTTP -- typically a co-located :class:`MMReceiver` -- share
-    that list by reference: register/unregister mutate it in place under an
-    internal lock, and the receiver simply reads ``self.encode_urls`` (the
+    that list by reference: register/unregister mutate it in place under the
+    registry's lock, and the receiver simply reads ``self.encode_urls`` (the
     same list).  When ``urls`` is ``None`` the server allocates its own list,
     accessible through :meth:`list_urls`.
+
+    Registration carries an optional ``instance_id`` so a heartbeat from a
+    retired encoder generation is rejected (see :class:`EncoderRegistry`).
+    Register/unregister/list require ``Authorization: Bearer <token>`` when
+    ``SGLANG_ENCODER_BOOTSTRAP_TOKEN`` is set; ``/health`` never does.
 
     Health-check tuning is controlled by env vars
     ``SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL`` (seconds; 0 disables),
@@ -165,13 +531,37 @@ class EncoderBootstrapServer:
         health_check_interval: Optional[float] = None,
         health_check_timeout: Optional[float] = None,
         evicted_ttl: Optional[float] = None,
+        token: Optional[str] = None,
+        allowed_url_prefixes: Optional[List[str]] = None,
+        max_urls: Optional[int] = None,
     ):
 
         self.host = host
         self.port = port
         self._urls: List[str] = urls if urls is not None else []
-        self._lock = threading.Lock()
+        self._registry = EncoderRegistry(
+            urls=self._urls,
+            allowed_url_prefixes=(
+                allowed_url_prefixes
+                if allowed_url_prefixes is not None
+                else parse_allowed_prefixes(
+                    envs.SGLANG_ENCODER_BOOTSTRAP_ALLOWED_URL_PREFIXES.get()
+                )
+            ),
+            max_urls=(
+                max_urls
+                if max_urls is not None
+                else envs.SGLANG_ENCODER_BOOTSTRAP_MAX_URLS.get()
+            ),
+        )
+        self._auth_token = (
+            token
+            if token is not None
+            else envs.SGLANG_ENCODER_BOOTSTRAP_TOKEN.get()
+        )
         self._server: Optional[uvicorn.Server] = None  # set in _run_server
+        self._bind_error: Optional[BaseException] = None
+        self._probe_fallback_warned: Set[str] = set()
         self._health_check_interval = (
             health_check_interval
             if health_check_interval is not None
@@ -188,13 +578,9 @@ class EncoderBootstrapServer:
             else envs.SGLANG_ENCODER_BOOTSTRAP_EVICTED_TTL.get()
         )
         # Evict only after this many consecutive probe failures (a busy
-        # encoder can miss a single 2s probe under load), and keep probing
-        # evicted URLs so they re-register automatically once healthy.
-        # Values are eviction timestamps; URLs older than ``_evicted_ttl``
-        # (when > 0) are permanently dropped.
+        # encoder can miss a single short-timeout probe under load), and keep
+        # probing evicted URLs so they re-register automatically once healthy.
         self._health_fail_threshold = 3
-        self._health_fail_counts: Dict[str, int] = {}
-        self._evicted_urls: Dict[str, float] = {}
 
         @asynccontextmanager
         async def lifespan(fast_api_app: FastAPI):
@@ -215,32 +601,52 @@ class EncoderBootstrapServer:
             lifespan=lifespan, openapi_url=None, **fastapi_telemetry_disabled_kwargs()
         )
 
+        def _authorized(request: Request) -> bool:
+            return is_authorized(
+                request.headers.get("authorization"), self._auth_token
+            )
+
         @self.app.get("/health")
         async def _health() -> Response:
             return Response("OK")
 
         @self.app.post("/register_encoder_url")
-        async def _register(data: dict):
+        async def _register(data: dict, request: Request):
+            if not _authorized(request):
+                return ORJSONResponse({"error": "Unauthorized"}, status_code=401)
             url = data.get("url") if isinstance(data, dict) else None
-            if not url:
+            if not isinstance(url, str) or not url:
                 return ORJSONResponse(
                     {"error": "Missing or empty 'url' field"}, status_code=400
                 )
-            self.register(url)
-            return Response("OK")
+            instance_id = data.get("instance_id")
+            if not isinstance(instance_id, str):
+                instance_id = None
+            result = self._registry.register(url, instance_id)
+            # 200 on purpose even when rejected: encoders retry on non-2xx,
+            # and a policy rejection is not a transient failure.  The reason
+            # is always reported so operators can see why an encoder was
+            # ignored (allowlist, cap, retired generation, already present).
+            return ORJSONResponse(
+                {"accepted": result.accepted, "reason": result.reason}
+            )
 
         @self.app.delete("/unregister_encoder_url")
-        async def _unregister(data: dict):
+        async def _unregister(data: dict, request: Request):
+            if not _authorized(request):
+                return ORJSONResponse({"error": "Unauthorized"}, status_code=401)
             url = data.get("url") if isinstance(data, dict) else None
-            if not url:
+            if not isinstance(url, str) or not url:
                 return ORJSONResponse(
                     {"error": "Missing or empty 'url' field"}, status_code=400
                 )
             self.unregister(url)
-            return Response("OK")
+            return ORJSONResponse({"accepted": True})
 
         @self.app.get("/list_encoder_urls")
-        async def _list():
+        async def _list(request: Request):
+            if not _authorized(request):
+                return ORJSONResponse({"error": "Unauthorized"}, status_code=401)
             return {"encoder_urls": self.list_urls()}
 
         self.thread = threading.Thread(
@@ -251,54 +657,45 @@ class EncoderBootstrapServer:
     # ------------------------------------------------------------------ #
     # In-process API (thread-safe; safe to call from any thread)         #
     # ------------------------------------------------------------------ #
-    def register(self, url: str) -> bool:
-        """Add *url* if not already present.  Returns True if added."""
-        with self._lock:
-            self._health_fail_counts.pop(url, None)
-            self._evicted_urls.pop(url, None)
-            if url not in self._urls:
-                self._urls.append(url)
-                logger.info(f"Registered encoder URL: {url}")
-                return True
-            logger.debug(f"Encoder URL already registered: {url}")
-            return False
+    def register(self, url: str, instance_id: Optional[str] = None) -> bool:
+        """Register *url*; True only when a new URL/generation was accepted."""
+        return self._registry.register(url, instance_id).accepted
 
     def unregister(self, url: str) -> bool:
-        """Remove *url* if present.  Returns True if removed.
-
-        An explicit unregister also drops the URL from the health-check
-        revival set so it does not come back automatically.
-        """
-        with self._lock:
-            removed = url in self._urls or url in self._evicted_urls
-            if url in self._urls:
-                self._urls.remove(url)
-            self._evicted_urls.pop(url, None)
-            self._health_fail_counts.pop(url, None)
-            if removed:
-                logger.info(f"Unregistered encoder URL: {url}")
-            return removed
+        """Remove *url* and tombstone its current generation."""
+        return self._registry.unregister(url)
 
     def list_urls(self) -> List[str]:
         """Return a snapshot of all registered encoder URLs."""
-        with self._lock:
-            return list(self._urls)
+        return self._registry.list_urls()
 
     # ------------------------------------------------------------------ #
     # Health check                                                       #
     # ------------------------------------------------------------------ #
+    def _warn_probe_fallback(self, url: str) -> None:
+        """Log the /health fallback once per encoder URL."""
+        if url in self._probe_fallback_warned:
+            return
+        self._probe_fallback_warned.add(url)
+        logger.warning(
+            "Encoder %s returned 404 on %s; falling back to /health",
+            url,
+            envs.SGLANG_ENCODER_BOOTSTRAP_HEALTH_PATH.get(),
+        )
+
     async def _probe(self, session, url: str) -> bool:
-        try:
-            async with session.get(f"{url}/health") as resp:
-                return resp.status == 200
-        except Exception:
-            return False
+        return await probe_with_fallback(
+            session,
+            url,
+            envs.SGLANG_ENCODER_BOOTSTRAP_HEALTH_PATH.get(),
+            self._warn_probe_fallback,
+        )
 
     async def _health_check_loop(self):
         """Probe registered (and previously evicted) encoders periodically.
 
         A URL is evicted only after ``_health_fail_threshold`` consecutive
-        probe failures — a busy encoder may miss a single short-timeout probe
+        probe failures -- a busy encoder may miss a single short-timeout probe
         under load. Evicted URLs keep being probed and re-register
         automatically once they respond again. After ``_evicted_ttl`` seconds
         without a successful probe (when > 0), they are permanently dropped
@@ -310,20 +707,9 @@ class EncoderBootstrapServer:
             try:
                 await asyncio.sleep(self._health_check_interval)
                 now = time.time()
-                with self._lock:
-                    expired = []
-                    if self._evicted_ttl > 0:
-                        expired = [
-                            url
-                            for url, ts in self._evicted_urls.items()
-                            if now - ts >= self._evicted_ttl
-                        ]
-                        for url in expired:
-                            self._evicted_urls.pop(url, None)
-                            self._health_fail_counts.pop(url, None)
-                    candidates = list(
-                        dict.fromkeys(self._urls + list(self._evicted_urls))
-                    )
+                expired, candidates = self._registry.prepare_health_round(
+                    now, self._evicted_ttl
+                )
                 if expired:
                     logger.warning(
                         f"Health check permanently dropped {len(expired)} "
@@ -337,27 +723,11 @@ class EncoderBootstrapServer:
                         *(self._probe(session, url) for url in candidates),
                         return_exceptions=True,
                     )
-                evicted, revived = [], []
-                with self._lock:
-                    for url, ok in zip(candidates, results):
-                        if ok is True:
-                            self._health_fail_counts.pop(url, None)
-                            if url in self._evicted_urls:
-                                self._evicted_urls.pop(url, None)
-                                if url not in self._urls:
-                                    self._urls.append(url)
-                                revived.append(url)
-                        else:
-                            if url in self._evicted_urls:
-                                continue
-                            count = self._health_fail_counts.get(url, 0) + 1
-                            self._health_fail_counts[url] = count
-                            if count >= self._health_fail_threshold:
-                                if url in self._urls:
-                                    self._urls.remove(url)
-                                self._evicted_urls[url] = now
-                                self._health_fail_counts.pop(url, None)
-                                evicted.append(url)
+                evicted, revived = self._registry.apply_health_results(
+                    list(zip(candidates, results)),
+                    now,
+                    self._health_fail_threshold,
+                )
                 if revived:
                     logger.info(
                         f"Health check revived {len(revived)} encoder(s): {revived}"
@@ -394,8 +764,55 @@ class EncoderBootstrapServer:
         )
         try:
             self._server.run()
-        except Exception as e:
-            logger.error(f"EncoderBootstrapServer error: {e}", exc_info=True)
+        except (Exception, SystemExit) as e:
+            # uvicorn reports a bind failure (port in use, bad host) through
+            # SystemExit after logging, so catch both and surface it instead
+            # of leaving the thread silently dead.
+            self._bind_error = e
+            logger.error(
+                "EncoderBootstrapServer bind failed on %s:%s: %s",
+                self.host,
+                self.port,
+                e,
+                exc_info=True,
+            )
+
+    @property
+    def bind_error(self) -> Optional[BaseException]:
+        return self._bind_error
+
+    def wait_bound(self, timeout: float = 5.0) -> None:
+        """Block until the bootstrap HTTP server is reachable.
+
+        Raises if uvicorn failed to bind (port in use, bad host) or the
+        server did not come up in time, so the prefill no longer starts with
+        a silently dead encoder registry.
+        """
+        deadline = time.monotonic() + timeout
+        probe_host = "127.0.0.1" if self.host in ("0.0.0.0", "::", "") else self.host
+        while time.monotonic() < deadline:
+            if self._bind_error is not None:
+                raise RuntimeError(
+                    f"EncoderBootstrapServer bind failed on {self.host}:{self.port}: "
+                    f"{self._bind_error}"
+                )
+            # A TCP connect alone is not enough: any unrelated listener on the
+            # port accepts it.  Require a real HTTP answer from /health.
+            try:
+                with socket.create_connection((probe_host, self.port), timeout=0.2) as conn:
+                    conn.sendall(
+                        b"GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n"
+                    )
+                    answer = conn.recv(64)
+                if answer.startswith(b"HTTP/") and b" 200" in answer[:16]:
+                    return
+            except OSError:
+                pass
+            time.sleep(0.05)
+        raise RuntimeError(
+            f"EncoderBootstrapServer did not start on {self.host}:{self.port} "
+            f"within {timeout:.1f}s"
+        )
 
     def close(self):
         if self._server is not None:

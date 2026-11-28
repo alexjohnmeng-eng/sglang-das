@@ -817,6 +817,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 port=get_disagg().encoder_bootstrap_port,
                 urls=self.encoder_urls,
             )
+            # Fail startup if the port is taken: a silently dead bootstrap
+            # thread would leave the prefill with a frozen encoder registry.
+            self.encoder_bootstrap_server.wait_bound()
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
                 dtype=self.model_config.dtype,

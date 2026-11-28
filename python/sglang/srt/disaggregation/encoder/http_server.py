@@ -25,6 +25,8 @@ from fastapi.responses import ORJSONResponse, Response
 
 import sglang.srt.disaggregation.encoder.server as server_module
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation.encoder.bootstrap_heartbeat import BootstrapHeartbeat
+from sglang.srt.disaggregation.encoder.bootstrap_targets import BootstrapTargets
 from sglang.srt.disaggregation.encoder.runtime import (
     DPDispatcher,
     EncoderRuntime,
@@ -40,6 +42,7 @@ from sglang.srt.disaggregation.encoder.server import (
     MMEncoder,
     MMError,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
@@ -81,6 +84,14 @@ local_runtime: Optional[EncoderRuntime] = None
 # and ZMQ; HTTP only keeps the dispatcher handle used by route handlers.
 dp_dispatcher: Optional["DPDispatcher"] = None
 
+# Bootstrap registration state. instance_id is generated once per process so a
+# heartbeat re-registration is distinguishable from a different replica.
+_ENCODER_INSTANCE_ID = uuid.uuid4().hex
+_registration_heartbeat: Optional[BootstrapHeartbeat] = None
+_registration_targets: Optional[BootstrapTargets] = None
+_registration_started = False
+_registration_shutdown_registered = False
+
 
 def is_health_check_request(rid: Optional[str]) -> bool:
     return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
@@ -105,27 +116,62 @@ app = FastAPI(lifespan=_lifespan, **fastapi_telemetry_disabled_kwargs())
 
 
 def _register_encoder_url_with_bootstrap():
-    """Asynchronously register this encoder with each bootstrap URL.
+    """Register this encoder with the prefill bootstrap(s).
 
-    Spawns a daemon thread that retries each URL independently with bounded
-    backoff.  The encoder's own startup is not blocked: if some bootstrap
-    server is slow or unreachable, only the background worker waits.
-
-    Inspired by ``_ensure_prefill_info`` in disaggregation/decode.py: each
-    target keeps its own retry count and is retried at a fixed interval
-    instead of serialising sleeps in a single thread.
+    With ``SGLANG_ENCODER_REGISTER_HEARTBEAT_S > 0`` a background heartbeat
+    re-posts the URL every interval, so a prefill that restarts or is added
+    later converges without an encoder restart.  A targets-file watcher feeds
+    add/remove events into the heartbeat.  ``..._HEARTBEAT_S == 0`` keeps the
+    legacy bounded one-shot retry loop.
     """
+
+    global _registration_heartbeat, _registration_targets, _registration_started
+
+    if _registration_started:
+        return
+    _registration_started = True
 
     host = get_serving().host
     if not host or host in ("0.0.0.0", "::"):
         host = get_local_ip_auto(get_serving().host)
     scheme = "https" if get_serving().ssl_certfile else "http"
     encoder_url = NetworkAddress(host, get_serving().port).to_url(scheme)
-    payload = {"url": encoder_url}
-    bootstrap_urls = list(get_disagg().encoder_register_urls)
-    if not bootstrap_urls:
+
+    static_urls = list(get_disagg().encoder_register_urls)
+    targets_file = envs.SGLANG_ENCODER_REGISTER_TARGETS_FILE.get()
+    targets = BootstrapTargets(
+        static_urls,
+        file_path=targets_file,
+        poll_s=envs.SGLANG_ENCODER_REGISTER_TARGETS_POLL_S.get(),
+    )
+    # Read the file synchronously so the first heartbeat already covers every
+    # configured prefill instead of waiting one poll interval.
+    initial_urls = targets.snapshot()
+
+    token = envs.SGLANG_ENCODER_BOOTSTRAP_TOKEN.get()
+    heartbeat_s = envs.SGLANG_ENCODER_REGISTER_HEARTBEAT_S.get()
+
+    if heartbeat_s > 0:
+        heartbeat = BootstrapHeartbeat(
+            encoder_url,
+            initial_urls,
+            instance_id=_ENCODER_INSTANCE_ID,
+            token=token,
+            heartbeat_s=heartbeat_s,
+            max_backoff_s=envs.SGLANG_ENCODER_REGISTER_MAX_BACKOFF_S.get(),
+        )
+        heartbeat.start()
+        _registration_heartbeat = heartbeat
+        if targets_file and targets.poll_s > 0:
+            targets.start(heartbeat.update_targets)
+            _registration_targets = targets
         return
 
+    if not initial_urls:
+        return
+
+    payload = {"url": encoder_url, "instance_id": _ENCODER_INSTANCE_ID}
+    headers = {"Authorization": f"Bearer {token}"} if token else None
     max_retries = 30
     retry_interval = 5.0
     request_timeout = 5.0
@@ -135,6 +181,7 @@ def _register_encoder_url_with_bootstrap():
             resp = http_requests.post(
                 f"{bootstrap_url}/register_encoder_url",
                 json=payload,
+                headers=headers,
                 timeout=request_timeout,
             )
             if resp.status_code == 200:
@@ -151,7 +198,7 @@ def _register_encoder_url_with_bootstrap():
         return False
 
     def _worker():
-        pending = list(bootstrap_urls)
+        pending = list(initial_urls)
         retry_count = {url: 0 for url in pending}
         while pending:
             still_pending = []
@@ -176,19 +223,28 @@ def _register_encoder_url_with_bootstrap():
     ).start()
 
 
-def _unregister_encoder_url_from_bootstrap():
+def _unregister_encoder_url_from_bootstrap(extra_urls: Optional[List[str]] = None):
     host = get_serving().host
     if not host or host in ("0.0.0.0", "::"):
         host = get_local_ip_auto(get_serving().host)
     scheme = "https" if get_serving().ssl_certfile else "http"
     encoder_url = NetworkAddress(host, get_serving().port).to_url(scheme)
     payload = {"url": encoder_url}
+    token = envs.SGLANG_ENCODER_BOOTSTRAP_TOKEN.get()
+    headers = {"Authorization": f"Bearer {token}"} if token else None
 
-    for bootstrap_url in get_disagg().encoder_register_urls:
+    # Static args plus every target the heartbeat actually registered with:
+    # prefills discovered through the targets file are not in
+    # encoder_register_urls, so a graceful shutdown must DELETE there too.
+    bootstrap_urls = list(
+        dict.fromkeys([*get_disagg().encoder_register_urls, *(extra_urls or [])])
+    )
+    for bootstrap_url in bootstrap_urls:
         try:
             resp = http_requests.delete(
                 f"{bootstrap_url}/unregister_encoder_url",
                 json=payload,
+                headers=headers,
                 timeout=2.0,
             )
             if resp.status_code == 200:
@@ -205,8 +261,30 @@ def _unregister_encoder_url_from_bootstrap():
             logger.debug(f"Unregister from {bootstrap_url} failed: {e}")
 
 
+def _shutdown_registration():
+    """Stop background registration, then unregister exactly once.
+
+    The heartbeat stop timeout must exceed the per-request timeout (5s) so an
+    in-flight POST finishes/aborts before the DELETE races it.
+    """
+    global _registration_heartbeat, _registration_targets
+
+    heartbeat = _registration_heartbeat
+    targets = _registration_targets
+    _registration_heartbeat = None
+    _registration_targets = None
+
+    heartbeat_urls = heartbeat.current_targets() if heartbeat is not None else []
+    if targets is not None:
+        targets.stop()
+    if heartbeat is not None:
+        heartbeat.stop(timeout=max(6.0, 2 * 5.0))
+    _unregister_encoder_url_from_bootstrap(extra_urls=heartbeat_urls)
+
+
 def launch_server(server_args: ServerArgs):
     global dp_dispatcher, encoder, encoder_scheduler, local_runtime, send_sockets
+    global _registration_shutdown_registered
 
     configure_logger(server_args, prefix=" encode_server")
     publish(server_args, role="encoder")
@@ -226,12 +304,18 @@ def launch_server(server_args: ServerArgs):
         if get_observability().enable_metrics:
             add_prometheus_middleware(app)
 
-    # Register this encoder's URL with prefill server(s) if configured.
-    if get_disagg().encoder_register_urls:
+    # Register this encoder's URL with prefill server(s) if configured either
+    # statically or through the hot-reloaded targets file.
+    if (
+        get_disagg().encoder_register_urls
+        or envs.SGLANG_ENCODER_REGISTER_TARGETS_FILE.get()
+    ):
         import atexit
 
         _register_encoder_url_with_bootstrap()
-        atexit.register(_unregister_encoder_url_from_bootstrap)
+        if not _registration_shutdown_registered:
+            atexit.register(_shutdown_registration)
+            _registration_shutdown_registered = True
 
     uvicorn.run(app, host=get_serving().host, port=get_serving().port)
 
@@ -539,6 +623,14 @@ async def handle_scheduler_receive_url_request(request: dict):
             },
         )
     return ORJSONResponse(content=None)
+
+
+@app.get("/live")
+async def live():
+    """Cheap liveness probe: no dummy encode, unlike /health."""
+    if dp_dispatcher is not None and not dp_dispatcher.all_ranks_alive:
+        return Response(status_code=503)
+    return Response(status_code=200, content="OK")
 
 
 @app.get("/health")

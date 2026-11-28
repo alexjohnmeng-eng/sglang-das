@@ -1752,6 +1752,31 @@ class Envs:
     SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT = EnvFloat(2.0)
     # Seconds before permanently dropping an unhealthy encoder (0 = keep probing).
     SGLANG_ENCODER_BOOTSTRAP_EVICTED_TTL = EnvFloat(600.0)
+    # Path the prefill probes for encoder liveness.  The default /health runs a
+    # real dummy encode; set /live (cheap, no encode) so M prefills x N
+    # encoders do not each trigger an encode every probe interval.
+    SGLANG_ENCODER_BOOTSTRAP_HEALTH_PATH = EnvStr("/health")
+    # Encoder -> prefill bootstrap registration heartbeat.  Encoders used to
+    # register once with bounded retries, so a prefill that restarted later
+    # stayed without encoders until they restarted too.  With a heartbeat the
+    # encoder re-posts its URL every interval and a restarted/new prefill
+    # converges within one period.  0 keeps the legacy one-shot behaviour.
+    SGLANG_ENCODER_REGISTER_HEARTBEAT_S = EnvFloat(15.0)
+    SGLANG_ENCODER_REGISTER_MAX_BACKOFF_S = EnvFloat(60.0)
+    # Optional JSON file listing the prefill bootstrap URLs for the heartbeat
+    # to (re)register with.  Re-read on mtime change so new prefill replicas
+    # can be added without restarting the encoders.  Empty = static args only.
+    SGLANG_ENCODER_REGISTER_TARGETS_FILE = EnvStr("")
+    SGLANG_ENCODER_REGISTER_TARGETS_POLL_S = EnvFloat(10.0)
+    # Shared bearer token for the bootstrap registration endpoints.  Empty
+    # disables auth (legacy).  When set, the encoder sends it and the prefill
+    # rejects register/unregister/list requests that do not carry it.
+    SGLANG_ENCODER_BOOTSTRAP_TOKEN = EnvStr("")
+    # Comma-separated URL prefixes the prefill accepts from /register.  Empty
+    # accepts any URL (legacy).  Guards against SSRF into arbitrary hosts.
+    SGLANG_ENCODER_BOOTSTRAP_ALLOWED_URL_PREFIXES = EnvStr("")
+    # Upper bound on the number of encoders one prefill keeps registered.
+    SGLANG_ENCODER_BOOTSTRAP_MAX_URLS = EnvInt(64)
     # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
     # 0 disables (per-request register/deregister). 4096 = 4GB default per TP.
     # In "hsa_ipc" sharing mode the value is the WHOLE group's arena, not per rank.
